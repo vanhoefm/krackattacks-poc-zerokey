@@ -1,2 +1,2 @@
 #!/bin/bash
-../hostapd/hostapd hostapd.conf $@
+hostapd hostapd.conf $@
