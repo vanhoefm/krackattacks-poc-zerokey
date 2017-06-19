@@ -69,6 +69,8 @@ static unsigned char gcookie[COOKIE_LEN];
 #define HOSTAPD_GLOBAL_CTRL_IFACE_PORT_LIMIT	50
 #endif /* CONFIG_CTRL_IFACE_UDP */
 
+int ieee802_11_mgmt(struct hostapd_data *hapd, const u8 *buf, size_t len, struct hostapd_frame_info *fi);
+
 static void hostapd_ctrl_iface_send(struct hostapd_data *hapd, int level,
 				    enum wpa_msg_type type,
 				    const char *buf, size_t len);
@@ -1874,6 +1876,42 @@ static int hostapd_ctrl_get_fail(struct hostapd_data *hapd,
 #endif /* CONFIG_TESTING_OPTIONS */
 
 
+static int hostapd_ctrl_iface_rx_mgmt(struct hostapd_data *hapd, char *cmd)
+{
+	char *pos;
+	u8 *buf;
+	size_t len;
+
+	wpa_printf(MSG_DEBUG, "External STA Authentication: %s", cmd);
+
+	pos = cmd;
+	while (*pos == ' ')
+		pos++;
+
+	len = os_strlen(pos);
+	if (len & 1)
+		return -1;
+	len /= 2;
+
+	buf = os_malloc(len);
+	if (buf == NULL)
+		return -1;
+
+	if (hexstr2bin(pos, buf, len) < 0) {
+		os_free(buf);
+		return -1;
+	}
+
+	struct hostapd_frame_info fi;
+	memset(&fi, 0, sizeof(fi));
+
+	ieee802_11_mgmt(hapd, buf, len, &fi);
+	os_free(buf);
+
+	return 0;
+}
+
+
 static int hostapd_ctrl_iface_chan_switch(struct hostapd_iface *iface,
 					  char *pos)
 {
@@ -2354,7 +2392,7 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
 			else
 				reply_len += res;
 		}
-		if (reply_len >= 0) {
+		if (reply_len >= 0) { 
 			res = ieee802_1x_get_mib(hapd, reply + reply_len,
 						 reply_size - reply_len);
 			if (res < 0)
@@ -2586,6 +2624,9 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
 	} else if (os_strcmp(buf, "DRIVER_FLAGS") == 0) {
 		reply_len = hostapd_ctrl_driver_flags(hapd->iface, reply,
 						      reply_size);
+	} else if (os_strncmp(buf, "RX_MGMT ", 8) == 0) {
+		if (hostapd_ctrl_iface_rx_mgmt(hapd, buf + 8) < 0)
+			reply_len = -1;
 	} else {
 		os_memcpy(reply, "UNKNOWN COMMAND\n", 16);
 		reply_len = 16;
