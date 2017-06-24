@@ -257,8 +257,10 @@ int wpa_write_rsn_ie(struct wpa_auth_config *conf, u8 *buf, size_t len,
 	if (conf->peerkey)
 		capab |= WPA_CAPABILITY_PEERKEY_ENABLED;
 	if (conf->wmm_enabled) {
-		/* 4 PTKSA replay counters when using WMM */
-		capab |= (RSN_NUM_REPLAY_COUNTERS_16 << 2);
+		/* PTKSA replay counters when using WMM */
+		capab |= (conf->rsn_ptksa_counters << 2);
+		/* GTKSA replay counters when using WMM */
+		capab |= (conf->rsn_gtksa_counters << 4);
 	}
 #ifdef CONFIG_IEEE80211W
 	if (conf->ieee80211w != NO_MGMT_FRAME_PROTECTION) {

@@ -60,6 +60,9 @@ void hostapd_config_defaults_bss(struct hostapd_bss_config *bss)
 	bss->wpa_group = WPA_CIPHER_TKIP;
 	bss->rsn_pairwise = 0;
 
+	bss->rsn_ptksa_counters = 3;
+	bss->rsn_gtksa_counters = 3;
+
 	bss->max_num_sta = MAX_STA_COUNT;
 
 	bss->dtim_period = 2;
