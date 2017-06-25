@@ -1629,7 +1629,7 @@ void __wpa_send_eapol(struct wpa_authenticator *wpa_auth,
 			   1);
 #ifdef KRACK_ROGUE_AP
 	// Note: there is never any point in sending EAPOL frames, because we do not know the valid KCK and KEK.
-	printf(">>>> %s: not sending EAPOL frame\n", __FUNCTION__);
+	printf(">>> %s: not sending EAPOL frame\n", __FUNCTION__);
 #else
 	wpa_auth_send_eapol(wpa_auth, sm->addr, (u8 *) hdr, len,
 			    sm->pairwise_set);

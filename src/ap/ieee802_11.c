@@ -3514,6 +3514,11 @@ void ieee802_11_rx_from_unknown(struct hostapd_data *hapd, const u8 *src,
 {
 	struct sta_info *sta;
 
+#ifdef KRACK_ROGUE_AP
+	printf(">>> ieee802_11_rx_from_unknown: not sending deauth/disassoc\n");
+	return;
+#endif
+
 	sta = ap_get_sta(hapd, src);
 	if (sta && (sta->flags & WLAN_STA_ASSOC)) {
 		if (!hapd->conf->wds_sta)
