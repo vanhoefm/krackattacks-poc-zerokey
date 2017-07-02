@@ -7,6 +7,8 @@ from datetime import datetime
 from wpaspy import Ctrl
 
 # TODO:
+# - Check that interfaces are not in use by another application (similar to airmon-ng)
+# - Test against enterprise authentication. We will also have to forward EAP frames!
 # - Show "-- forwarding" when we haven't confirmed MitM on rouge channel, and "-- MitM'ing" when on rouge channel
 #
 # - If EAPOL-Msg4 has been received on the real channel, the MitM attack has failed (maybe deauthenticate then)
@@ -14,6 +16,11 @@ from wpaspy import Ctrl
 # - Detect usage off all-zero key by decrypting frames (so we can miss some frames safely)
 # - Handle forwarded messages that are too long (= stupid Linux kernel bug)
 # - Prefix Warning or Error messages? What if they are just colored?
+#
+# Notes:
+# - This was tested using scapy 
+# - Dependencies: python-scapy (tested using 2.3.3), libnl-3-dev, libnl-genl-3-dev, pkg-config, libssl-dev, net-tools, macchanger
+#   * cp defconfig .config
 #
 # Research:
 # - Investigate how to make Atheros ACK all frames, while still allowing frame injection
@@ -730,6 +737,8 @@ class KRAckAttack():
 		self.hostapd_log.write(datetime.now().strftime('[%H:%M:%S] ') + line)
 
 	def configure_interfaces(self):
+		log(STATUS, "Note: remember to disable Wi-Fi in your network manager so it doesn't interfere with this script")
+
 		# 1. Remove unused virtual interfaces
 		subprocess.call(["iw", self.nic_real + "sta1", "del"], stdout=subprocess.PIPE, stdin=subprocess.PIPE)
 		if self.nic_rogue_mon is None:
