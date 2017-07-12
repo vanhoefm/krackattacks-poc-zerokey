@@ -6,17 +6,6 @@ import sys, os, socket, struct, time, argparse, heapq, subprocess, atexit, selec
 from datetime import datetime
 from wpaspy import Ctrl
 
-# TODO:
-# - Check that interfaces are not in use by another application (similar to airmon-ng)
-# - Test against enterprise authentication. We will also have to forward EAP frames!
-# - Show "-- forwarding" when we haven't confirmed MitM on rouge channel, and "-- MitM'ing" when on rouge channel
-#
-# - If EAPOL-Msg4 has been received on the real channel, the MitM attack has failed (maybe deauthenticate then)
-#
-# - Detect usage off all-zero key by decrypting frames (so we can miss some frames safely)
-# - Handle forwarded messages that are too long (= stupid Linux kernel bug)
-# - Prefix Warning or Error messages? What if they are just colored?
-#
 # Notes:
 # - This was tested using scapy 
 # - Dependencies: python-scapy (tested using 2.3.3), libnl-3-dev, libnl-genl-3-dev, pkg-config, libssl-dev, net-tools, macchanger
@@ -26,9 +15,16 @@ from wpaspy import Ctrl
 # - Investigate how to make Atheros ACK all frames, while still allowing frame injection
 # - Reuse hostapd/kernel functionality to handle sleeping stations
 #
-# Weaponized features:
+# Optional future features:
 # - Option to attack specific client (search network its on, clone that one, and start attack)
-
+#
+# TODO:
+# - Test against enterprise authentication. We will also have to forward EAP frames!
+# - Show "-- forwarding" when we haven't confirmed MitM on rouge channel, and "-- MitM'ing" when on rouge channel
+# - If EAPOL-Msg4 has been received on the real channel, the MitM attack has failed (maybe deauthenticate then)
+# - Detect usage off all-zero key by decrypting frames (so we can miss some frames safely)
+# - Handle forwarded messages that are too long (= stupid Linux kernel bug)
+# - Prefix Warning or Error messages? What if they are just colored?
 
 IEEE_TLV_TYPE_SSID    = 0
 IEEE_TLV_TYPE_CHANNEL = 3
@@ -324,7 +320,7 @@ class NetworkConfig():
 			el = el.payload
 
 	# TODO: Check that there also isn't a real AP of this network on 
-	# the returned channel (possible for large networks e.g. eduraom).
+	# the returned channel (possible for large networks e.g. eduroam).
 	def find_rogue_channel(self):
 		self.rogue_channel = 1 if self.real_channel >= 6 else 11
 
