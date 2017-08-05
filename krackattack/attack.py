@@ -2,7 +2,7 @@
 import logging
 logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 from scapy.all import *
-import sys, os, socket, struct, time, argparse, heapq, subprocess, atexit, select
+import sys, os, socket, struct, time, argparse, heapq, subprocess, atexit, select, textwrap
 from datetime import datetime
 from wpaspy import Ctrl
 
@@ -875,7 +875,13 @@ def cleanup():
 	attack.stop()
 
 if __name__ == "__main__":
-	parser = argparse.ArgumentParser(description="Key Reinstallation Attacks (KRAck Attacks)", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+	description = textwrap.dedent(
+		"""\
+		Key Reinstallation Attacks (KRAck Attacks)
+		------------------------------------------
+		  - Uses CSA beacons to obtain channel-based MitM position
+		  - Can detect and handle wpa_supplicant all-zero key installations""")
+	parser = argparse.ArgumentParser(description=description, formatter_class=argparse.RawDescriptionHelpFormatter)
 	parser.add_argument("nic_real_mon", help="Wireless monitor interface that will listen on the channel of the target AP.")
 	parser.add_argument("nic_rogue_ap", help="Wireless monitor interface that will run a rogue AP using a modified hostapd.")
 	parser.add_argument("ssid", help="The SSID of the network to attack.")
