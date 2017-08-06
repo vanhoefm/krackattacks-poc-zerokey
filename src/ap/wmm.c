@@ -57,8 +57,10 @@ u8 * hostapd_eid_wmm(struct hostapd_data *hapd, u8 *eid)
 	int e;
 
 #ifdef KRACK_ROGUE_AP
-	printf(">>> %s: not including WMM element in beacon or probe response\n", __FUNCTION__);
-	return eid;
+	if (!hapd->conf->wmm_advertised) {
+		printf(">>> %s: not including WMM element in beacon or probe response\n", __FUNCTION__);
+		return eid;
+	}
 #else
 	if (!hapd->conf->wmm_enabled)
 		return eid;

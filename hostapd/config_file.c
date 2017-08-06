@@ -2822,6 +2822,8 @@ static int hostapd_config_fill(struct hostapd_config *conf,
 	} else if (os_strcmp(buf, "wme_enabled") == 0 ||
 		   os_strcmp(buf, "wmm_enabled") == 0) {
 		bss->wmm_enabled = atoi(pos);
+	} else if (os_strcmp(buf, "wmm_advertised") == 0) {
+		bss->wmm_advertised = atoi(pos);
 	} else if (os_strcmp(buf, "rsn_ptksa_counters") == 0) {
 		bss->rsn_ptksa_counters = atoi(pos);
 	} else if (os_strcmp(buf, "rsn_gtksa_counters") == 0) {

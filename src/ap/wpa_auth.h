@@ -149,6 +149,7 @@ struct wpa_auth_config {
 	int eapol_version;
 	int peerkey;
 	int wmm_enabled;
+	int wmm_advertised;
 	int rsn_ptksa_counters;
 	int rsn_gtksa_counters;
 	int wmm_uapsd;

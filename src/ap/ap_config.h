@@ -385,6 +385,7 @@ struct hostapd_bss_config {
 	int no_probe_resp_if_max_sta;
 
 	int wmm_enabled;
+	int wmm_advertised;
 	int rsn_ptksa_counters;
 	int rsn_gtksa_counters;
 	int wmm_uapsd;
