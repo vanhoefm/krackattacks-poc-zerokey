@@ -198,7 +198,7 @@ def get_eapol_replaynum(p):
 def dot11_to_str(p):
 	EAP_CODE = {1: "Request"}
 	EAP_TYPE = {1: "Identity"}
-	DEAUTH_REASON = {1: "Unspecified", 2: "Prev_Auth_No_Longer_Valid", 3: "STA_is_leaving", 4: "Inactivity", 6: "Unexp_Class2_Frame",
+	DEAUTH_REASON = {1: "Unspecified", 2: "Prev_Auth_No_Longer_Valid/Timeout", 3: "STA_is_leaving", 4: "Inactivity", 6: "Unexp_Class2_Frame",
 		7: "Unexp_Class3_Frame", 8: "Leaving", 15: "4-way_HS_timeout"}
 	dict_or_str = lambda d, v: d.get(v, str(v))
 	if p.type == 0:
@@ -882,9 +882,13 @@ if __name__ == "__main__":
 		  - Uses CSA beacons to obtain channel-based MitM position
 		  - Can detect and handle wpa_supplicant all-zero key installations""")
 	parser = argparse.ArgumentParser(description=description, formatter_class=argparse.RawDescriptionHelpFormatter)
+
+	# Required arguments
 	parser.add_argument("nic_real_mon", help="Wireless monitor interface that will listen on the channel of the target AP.")
 	parser.add_argument("nic_rogue_ap", help="Wireless monitor interface that will run a rogue AP using a modified hostapd.")
 	parser.add_argument("ssid", help="The SSID of the network to attack.")
+
+	# Optional arguments
 	parser.add_argument("-m", "--nic-rogue-mon", help="Wireless monitor interface that will listen on the channel of the rogue (cloned) AP.")
 	parser.add_argument("-t", "--target", help="Specifically target the client with the given MAC address.")
 	parser.add_argument("-p", "--dump", help="Dump captured traffic to the pcap files <this argument name>.<nic>.pcap")
