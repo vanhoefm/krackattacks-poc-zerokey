@@ -16,7 +16,7 @@ IEEE80211_RADIOTAP_DATA_RETRIES = (1 << 17)
 USAGE = """{name} - Tool to test Key Reinstallation Attacks against an AP
 
 To test wheter an AP is vulnerable to a Key Reinstallation Attack against
-the Fast BSS Transition (FT) handshake, execute the following steps:
+the Fast BSS Transition (FT) handshake, take the following steps:
 
 1. Create a wpa_supplicant configuration file that can be used to connect
    to the network. A basic example is:
@@ -73,9 +73,14 @@ the Fast BSS Transition (FT) handshake, execute the following steps:
 
    6a. First it should say "Detected FT reassociation frame". Then it will
        start replaying this frame to try the attack.
-   6b. The script shows which IVs the AP is using when sending data frames.
+   6b. The script shows which IVs (= packet numbers) the AP is using when
+       sending data frames.
    6c. Message "IV reuse detected (IV=X, seq=Y). AP is vulnerable!" means
        we confirmed it's vulnerable.
+
+  !! Be sure to manually check network traces as well, to confirm this script
+  !! is replaying the reassociation request properly, and to manually confirm
+  !! whether there is IV (= packet number) reuse or not.
 
    Example output of vulnerable AP:
       [15:59:24] Replaying Reassociation Request
@@ -84,7 +89,7 @@ the Fast BSS Transition (FT) handshake, execute the following steps:
       [15:59:26] AP transmitted data using IV=1 (seq=0)
       [15:59:26] IV reuse detected (IV=1, seq=0). AP is vulnerable!
 
-   Exampel output of patched AP (note that IVs are never reused):
+   Example output of patched AP (note that IVs are never reused):
       [16:00:49] Replaying Reassociation Request
       [16:00:49] AP transmitted data using IV=1 (seq=0)
       [16:00:50] AP transmitted data using IV=2 (seq=1)
@@ -118,12 +123,12 @@ class MitmSocket(L2Socket):
 		super(MitmSocket, self).__init__(**kwargs)
 
 	def send(self, p):
-		# Hack: set the More Data flag so we can detect injected frames
+		# Hack: set the More Data flag so we can detect injected frames (and so clients stay awake longer)
 		p[Dot11].FCfield |= 0x20
 		L2Socket.send(self, RadioTap()/p)
 
 	def _strip_fcs(self, p):
-		# Scapy can't handle FCS field automatically
+		# Scapy can't handle the optional Frame Check Sequence (FCS) field automatically
 		if p[RadioTap].present & 2 != 0:
 			rawframe = str(p[RadioTap])
 			pos = 8
@@ -223,13 +228,13 @@ class KRAckAttackFt():
 	def configure_interfaces(self):
 		log(STATUS, "Note: disable Wi-Fi in your network manager so it doesn't interfere with this script")
 
-		# 1. Remove unused virtual interfaces to start from clean state
+		# 1. Remove unused virtual interfaces to start from a clean state
 		subprocess.call(["iw", self.nic_mon, "del"], stdout=subprocess.PIPE, stdin=subprocess.PIPE)
 
 		# 2. Configure monitor mode on interfaces
 		subprocess.check_output(["iw", self.nic_iface, "interface", "add", self.nic_mon, "type", "monitor"])
 		# Some kernels (Debian jessie - 3.16.0-4-amd64) don't properly add the monitor interface. The following ugly
-		# sequence of commands to assure the virtual interface is registered as a 802.11 monitor interface.
+		# sequence of commands assures the virtual interface is properly registered as a 802.11 monitor interface.
 		subprocess.check_output(["iw", self.nic_mon, "set", "type", "monitor"])
 		time.sleep(0.5)
 		subprocess.check_output(["iw", self.nic_mon, "set", "type", "monitor"])
@@ -238,14 +243,12 @@ class KRAckAttackFt():
 	def run(self):
 		self.configure_interfaces()
 
-		# Make sure to use a recent backports driver package so we can indeed
-		# capture and inject packets in monitor mode.
 		self.sock = MitmSocket(type=ETH_P_ALL, iface=self.nic_mon)
 
-		# Set up a rouge AP that clones the target network (don't use tempfile - it can be useful to manually use the generated config)
+		# Open the wpa_supplicant client that will connect to the network that will be tested
 		self.wpasupp = subprocess.Popen(sys.argv[1:])
 
-		# Continue attack by monitoring both channels and performing needed actions
+		# Monitor the virtual monitor interface of the client and perform the needed actions
 		while True:
 			sel = select.select([self.sock], [], [], 1)
 			if self.sock in sel[0]: self.handle_rx()
@@ -284,7 +287,7 @@ if __name__ == "__main__":
 
 	interface = argv_get_interface()
 	if not interface:
-		log(ERROR, "Failed to determine interface. Specify one using -i parameter.")
+		log(ERROR, "Failed to determine wireless interface. Specify one using the -i parameter.")
 		quit(1)
 
 	attack = KRAckAttackFt(interface)
