@@ -48,7 +48,7 @@ the Fast BSS Transition (FT) handshake, take the following steps:
 
 4. Use wpa_cli to roam to a different AP of the same network. For example:
 
-      sudo wpa_cli
+      sudo wpa_cli -i wlan0
       > status
       bssid=c4:e9:84:db:fb:7b
       ssid=testnet
@@ -220,9 +220,12 @@ class KRAckAttackFt():
 		elif p.addr1 == self.clientmac and Dot11WEP in p:
 			iv = dot11_get_iv(p)
 			log(INFO, "AP transmitted data using IV=%d (seq=%d)" % (iv, dot11_get_seqnum(p)))
+
+			# FIXME: When the client disconnects (or reconnects), clear the set of used IVs
 			if iv in self.ivs:
 				log(INFO, ("IV reuse detected (IV=%d, seq=%d). " +
-					"AP is vulnerable!.") % (iv, dot11_get_seqnum(p)), color="green")
+					"AP is vulnerable!") % (iv, dot11_get_seqnum(p)), color="green")
+
 			self.ivs.add(iv)
 
 	def configure_interfaces(self):
