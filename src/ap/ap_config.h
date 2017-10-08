@@ -1,5 +1,6 @@
 /*
  * hostapd / Configuration definitions and helpers functions
+ * Copyright (c) 2017, Mathy Vanhoef <Mathy.Vanhoef@cs.kuleuven.be>
  * Copyright (c) 2003-2015, Jouni Malinen <j@w1.fi>
  *
  * This software may be distributed under the terms of the BSD license.
@@ -18,6 +19,8 @@
 #include "wps/wps.h"
 #include "fst/fst.h"
 #include "vlan.h"
+
+#include "common/attacks.h"
 
 /**
  * mesh_conf - local MBSS state and settings
@@ -385,9 +388,11 @@ struct hostapd_bss_config {
 	int no_probe_resp_if_max_sta;
 
 	int wmm_enabled;
+#ifdef KRACK_ROGUE_AP
 	int wmm_advertised;
 	int rsn_ptksa_counters;
 	int rsn_gtksa_counters;
+#endif
 	int wmm_uapsd;
 
 	struct hostapd_vlan *vlan;

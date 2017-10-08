@@ -1,5 +1,6 @@
 /*
  * IEEE 802.11 RSN / WPA Authenticator
+ * Copyright (c) 2017, Mathy Vanhoef <Mathy.Vanhoef@cs.kuleuven.be>
  * Copyright (c) 2004-2015, Jouni Malinen <j@w1.fi>
  *
  * This software may be distributed under the terms of the BSD license.
@@ -64,6 +65,7 @@ static u8 * ieee80211w_kde_add(struct wpa_state_machine *sm, u8 *pos);
 
 static const u32 dot11RSNAConfigGroupUpdateCount = 4;
 static const u32 dot11RSNAConfigPairwiseUpdateCount = 4;
+/* These three values are configured for the krackattacks project */
 static const u32 eapol_key_timeout_first = 1000000; /* ms */
 static const u32 eapol_key_timeout_subseq = 1000000; /* ms */
 static const u32 eapol_key_timeout_first_group = 1000000; /* ms */

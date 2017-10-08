@@ -1,5 +1,6 @@
 /*
  * hostapd - IEEE 802.11i-2004 / WPA Authenticator
+ * Copyright (c) 2017, Mathy Vanhoef <Mathy.Vanhoef@cs.kuleuven.be>
  * Copyright (c) 2004-2015, Jouni Malinen <j@w1.fi>
  *
  * This software may be distributed under the terms of the BSD license.
@@ -13,6 +14,8 @@
 #include "common/eapol_common.h"
 #include "common/wpa_common.h"
 #include "common/ieee802_11_defs.h"
+
+#include "common/attacks.h"
 
 #define MAX_OWN_IE_OVERRIDE 256
 
@@ -149,9 +152,11 @@ struct wpa_auth_config {
 	int eapol_version;
 	int peerkey;
 	int wmm_enabled;
+#ifdef KRACK_ROGUE_AP
 	int wmm_advertised;
 	int rsn_ptksa_counters;
 	int rsn_gtksa_counters;
+#endif
 	int wmm_uapsd;
 	int disable_pmksa_caching;
 	int okc;

@@ -1,5 +1,6 @@
 /*
  * hostapd / WPA authenticator glue code
+ * Copyright (c) 2017, Mathy Vanhoef <Mathy.Vanhoef@cs.kuleuven.be>
  * Copyright (c) 2002-2012, Jouni Malinen <j@w1.fi>
  *
  * This software may be distributed under the terms of the BSD license.
@@ -27,6 +28,7 @@
 #include "wpa_auth.h"
 #include "wpa_auth_glue.h"
 
+#include "common/attacks.h"
 
 static void hostapd_wpa_auth_conf(struct hostapd_bss_config *conf,
 				  struct hostapd_config *iconf,
@@ -46,9 +48,11 @@ static void hostapd_wpa_auth_conf(struct hostapd_bss_config *conf,
 	wconf->eapol_version = conf->eapol_version;
 	wconf->peerkey = conf->peerkey;
 	wconf->wmm_enabled = conf->wmm_enabled;
+#ifdef KRACK_ROGUE_AP
 	wconf->wmm_advertised = conf->wmm_advertised;
 	wconf->rsn_ptksa_counters = conf->rsn_ptksa_counters;
 	wconf->rsn_gtksa_counters = conf->rsn_gtksa_counters;
+#endif
 	wconf->wmm_uapsd = conf->wmm_uapsd;
 	wconf->disable_pmksa_caching = conf->disable_pmksa_caching;
 	wconf->okc = conf->okc;

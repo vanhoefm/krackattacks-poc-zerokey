@@ -1,5 +1,6 @@
 /*
  * hostapd - WPA/RSN IE and KDE definitions
+ * Copyright (c) 2017, Mathy Vanhoef <Mathy.Vanhoef@cs.kuleuven.be>
  * Copyright (c) 2004-2015, Jouni Malinen <j@w1.fi>
  *
  * This software may be distributed under the terms of the BSD license.
@@ -18,6 +19,7 @@
 #include "wpa_auth_ie.h"
 #include "wpa_auth_i.h"
 
+#include "common/attacks.h"
 
 #ifdef CONFIG_RSN_TESTING
 int rsn_testing = 0;
@@ -257,10 +259,15 @@ int wpa_write_rsn_ie(struct wpa_auth_config *conf, u8 *buf, size_t len,
 	if (conf->peerkey)
 		capab |= WPA_CAPABILITY_PEERKEY_ENABLED;
 	if (conf->wmm_enabled) {
+#ifdef KRACK_ROGUE_AP
 		/* PTKSA replay counters when using WMM */
 		capab |= (conf->rsn_ptksa_counters << 2);
 		/* GTKSA replay counters when using WMM */
 		capab |= (conf->rsn_gtksa_counters << 4);
+#else
+		/* 4 PTKSA replay counters when using WMM */
+		capab |= (RSN_NUM_REPLAY_COUNTERS_16 << 2);
+#endif
 	}
 #ifdef CONFIG_IEEE80211W
 	if (conf->ieee80211w != NO_MGMT_FRAME_PROTECTION) {

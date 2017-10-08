@@ -1,5 +1,6 @@
 /*
  * hostapd / Configuration helper functions
+ * Copyright (c) 2017, Mathy Vanhoef <Mathy.Vanhoef@cs.kuleuven.be>
  * Copyright (c) 2003-2014, Jouni Malinen <j@w1.fi>
  *
  * This software may be distributed under the terms of the BSD license.
@@ -19,6 +20,7 @@
 #include "sta_info.h"
 #include "ap_config.h"
 
+#include "common/attacks.h"
 
 static void hostapd_config_free_vlan(struct hostapd_bss_config *bss)
 {
@@ -60,8 +62,10 @@ void hostapd_config_defaults_bss(struct hostapd_bss_config *bss)
 	bss->wpa_group = WPA_CIPHER_TKIP;
 	bss->rsn_pairwise = 0;
 
+#ifdef KRACK_ROGUE_AP
 	bss->rsn_ptksa_counters = 3;
 	bss->rsn_gtksa_counters = 3;
+#endif
 
 	bss->max_num_sta = MAX_STA_COUNT;
 
@@ -90,7 +94,9 @@ void hostapd_config_defaults_bss(struct hostapd_bss_config *bss)
 
 	/* Set to -1 as defaults depends on HT in setup */
 	bss->wmm_enabled = -1;
+#ifdef KRACK_ROGUE_AP
 	bss->wmm_advertised = 1;
+#endif
 
 #ifdef CONFIG_IEEE80211R_AP
 	bss->ft_over_ds = 1;

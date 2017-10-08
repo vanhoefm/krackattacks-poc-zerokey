@@ -20,8 +20,6 @@
 #include "defs.h"
 #include "wpa_common.h"
 
-#include "common/attacks.h"
-
 static unsigned int wpa_kck_len(int akmp)
 {
 	switch (akmp) {

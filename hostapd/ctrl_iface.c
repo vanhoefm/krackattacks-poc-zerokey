@@ -1,5 +1,6 @@
 /*
  * hostapd / UNIX domain socket -based control interface
+ * Copyright (c) 2017, Mathy Vanhoef <Mathy.Vanhoef@cs.kuleuven.be>
  * Copyright (c) 2004-2015, Jouni Malinen <j@w1.fi>
  *
  * This software may be distributed under the terms of the BSD license.
@@ -70,8 +71,10 @@ static unsigned char gcookie[COOKIE_LEN];
 #define HOSTAPD_GLOBAL_CTRL_IFACE_PORT_LIMIT	50
 #endif /* CONFIG_CTRL_IFACE_UDP */
 
+#ifdef KRACK_ROGUE_AP
 int ieee802_11_mgmt(struct hostapd_data *hapd, const u8 *buf, size_t len, struct hostapd_frame_info *fi);
 void wpa_receive_msg4(struct wpa_authenticator *wpa_auth, struct wpa_state_machine *sm);
+#endif
 
 static void hostapd_ctrl_iface_send(struct hostapd_data *hapd, int level,
 				    enum wpa_msg_type type,
